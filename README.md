@@ -76,7 +76,7 @@ $env:PYTHONDONTWRITEBYTECODE = "1"
 python -B -m unittest discover -s tests -v
 
 # Replay & score official Days 1–5 pack (from repo root)
-python -B BuildSprint-R3-candidate/tools/run_days.py --cmd "python ../assist.py" --days 1-5 --out runs/final
+python -B BuildSprint-R3-candidate/tools/run_days.py --cmd "python assist.py" --days 1-5 --out runs/final
 python -B BuildSprint-R3-candidate/tools/score.py --run runs/final --days 1-5
 
 # Frontend TypeScript + Vite production build check
