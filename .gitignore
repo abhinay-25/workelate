@@ -1,0 +1,15 @@
+.r3_assist.db*
+.r3_dummy_store.json
+*.key
+runs/
+__pycache__/
+*.pyc
+.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+handoff.md
+DESIGN_NOTE.md
+BUILDSPRINT_R3_TECHNICAL_GUIDE.md
+BUILDSPRINT_R3_COMPLETE_TECHNICAL_GUIDE.pdf
+docs/
+plan/
