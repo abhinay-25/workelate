@@ -3,6 +3,8 @@
 import time
 from typing import Any
 
+from src.filters import strip_boilerplate_lines
+
 BRIEF_TOKEN_LIMIT = 8000
 ASK_TOKEN_LIMIT = 4000
 BRIEF_SAFE_BUDGET = 6000
@@ -58,7 +60,9 @@ def format_record_xml(record: Any) -> str:
     body = str(_field(record, "sanitized_body", "") or "").strip()
     if not body:
         return ""
-    safe_body = body.replace("</workplace_record>", "< /workplace_record>")
+    cleaned_lines = strip_boilerplate_lines(body)
+    effective_body = "\n".join(cleaned_lines).strip() if cleaned_lines else body
+    safe_body = effective_body.replace("</workplace_record>", "< /workplace_record>")
     rid = _esc_attr(_field(record, "id", ""))
     rtype = _esc_attr(_field(record, "type", ""))
     author = _esc_attr(_field(record, "author", ""))

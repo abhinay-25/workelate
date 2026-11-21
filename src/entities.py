@@ -385,6 +385,42 @@ def resolve_task_mentions(
                     }
                 )
 
+    if not matches and re.search(
+        r"\b(?:who\s+owns|owner\s+of|handles|when\s+is\b.*\bdue|due\s+date|deadline|"
+        r"status\s+of|is\s+the\b.*\b(?:done|ready|finished|complete|blocked)|"
+        r"which\s+[a-z]+\s+do\s+you\s+mean)\b",
+        clean_q,
+    ):
+        _GENERIC_TASK_WORDS = frozenset(
+            {
+                "task", "tasks", "item", "items", "thing", "things", "work",
+                "update", "updates", "fix", "plan", "copy", "page", "v1", "v2",
+                "launch", "invoice", "billing", "client", "account", "meeting",
+                "notes", "weekly", "monthly",
+            }
+        )
+        for row in rows:
+            tid = str(row["task_id"])
+            title = str(row["title"] or "")
+            t_tokens = [t for t in re.findall(r"[a-z0-9]{2,}", title.lower()) if t not in {"the", "for", "and", "to"}]
+            shared = [tok for tok in t_tokens if len(tok) >= 4 and tok not in _GENERIC_TASK_WORDS and tok in q_tokens]
+            if len(shared) == 1:
+                score = 2.5
+                if client_hint and row["client"] == client_hint:
+                    score += 2.0
+                elif client_hint and row["client"] and row["client"] != client_hint:
+                    score -= 2.0
+                if score > 0:
+                    matches.append(
+                        {
+                            "task_id": tid,
+                            "title": title,
+                            "client": row["client"],
+                            "score": score,
+                            "source_record_id": row["first_rec_id"],
+                        }
+                    )
+
     matches.sort(key=lambda x: (-x["score"], x["task_id"]))
     return matches
 

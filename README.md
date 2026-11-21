@@ -148,15 +148,45 @@ Select **Day 5 (`2026-11-06`)** and **`Meera Iyer (p02)`** (unless noted) to ver
 
 ## Official Days 1–5 Evaluation Benchmark (`tools/score.py`)
 
-| Category | Score | Points |
-|---|---:|---:|
-| Right briefs | 1.00 | 20.0 / 20 |
-| Right answers | 1.00 | 15.0 / 15 |
-| Honesty | 1.00 | 15.0 / 15 |
-| Memory | 1.00 | 15.0 / 15 |
-| Privacy | 1.00 | 10.0 / 10 |
-| Cost | 1.00 | 10.0 / 10 |
-| **TOTAL** | **100%** | **85.0 / 85** |
+| Category | Score | Points | Checks |
+|---|---:|---:|---:|
+| Right briefs | 1.00 | 20.0 / 20 | 7 |
+| Right answers | 1.00 | 15.0 / 15 | 33 |
+| Honesty | 1.00 | 15.0 / 15 | 40 |
+| Memory | 1.00 | 15.0 / 15 | 2 |
+| Privacy | 1.00 | 10.0 / 10 | 40 |
+| Cost | 1.00 | 10.0 / 10 | 40 |
+| **TOTAL** | **100%** | **85.0 / 85** | **(+ /10 Design Note)** |
+
+### Days 1–5 Per-Day Replay Results & 3 Hardest Edge Cases Fixed
+
+Every day (`Day 1` through `Day 5`) achieves `1.00` on briefs, `1.00` on answers, `1.00` on honesty, `1.00` on cost (`<= 8000` / `<= 4000`), and `0` privacy leaks (un-capped usefulness gate `1.00`).
+
+Below are the **3 hardest real failure modes** discovered while building and hardening the pipeline (and how each was solved cleanly for hidden days):
+
+1. **Same-Day Pre-Meeting Watermark & Stale Doc Carryover (`ev-nb-me-04`, `rnteufn1`)**:
+   - *Why naive systems fail*: Doc v2 (`rnteufn1`) updated `Launch date` from `10 Nov` to `14 Nov` on Day 4 while copying `"Billing contact: Kavya Nair"` verbatim from Day 1, and `rgg1ex2g` moved billing ownership on Day 2 (`45` minutes before Day 2's meeting prepared after Day 1).
+   - *Fix*: Per-`(person, client)` `since_day` high-watermarks plus per-field `effective_at_utc` carryover tracking in `src/docs_engine.py`, combined with authoritative manager/handover precedence in `src/claims.py`.
+2. **Task Comment Snapshot Overwrite Bug (`t-cl-06`, 11 comment records)**:
+   - *Why naive systems fail*: Later `comment`/`blocked` records (`r2vn8n1z`) carried stale top-level `owner: "p25"` snapshots after `rf9trkph` reassigned ownership to `p21` (`Manish Gupta`).
+   - *Fix*: Event-sourced reconstruction (`_replay_transitions` in `src/tasks_engine.py`) replays `change.field` transitions (`created`, `owner`, `due`, `status`) monotonically and ignores mutable comment snapshots.
+3. **Open-Ended / Hinglish Queries Matching Narrow Keyword Traps (`r3fbwbpq`)**:
+   - *Why naive systems fail*: Bare tokens like `"available"`, `"leave"`, or Roman-Hindi grammar words (`"kya"`, `"scene"`, `"kaam"`) either accidentally matched unrelated single-record keyword handlers (`r3fbwbpq`) or acted as mandatory FTS5 tokens causing `"I have nothing on that."` false negatives.
+   - *Fix*: Tightened leave matching, added `_HINGLISH_STOPWORDS` + `ANALYTICAL_META_WORDS` filtering (`src/retrieval/hybrid.py`, `src/ask.py`), and routed conversational/Hinglish/executive-memo prompts to grounded LLM synthesis backed by ACL-verified state summaries.
+
+---
+
+## Design Note, Models, Tools & AI Assistants Used
+
+- **One-Page Design Note**: See [DESIGN_NOTE.md](DESIGN_NOTE.md) for the complete architecture answers covering brief selection, memory persistence & ACL enforcement, truth/recency ordering, and hard safety refusals.
+- **Models & Failover Chain**:
+  - **Primary LLM**: Groq (`GROQ_API_KEY`, auto-failover across `llama-3.3-70b-versatile` / `openai/gpt-oss-120b` / `qwen/qwen3.8-27b` / `openai/gpt-oss-20b`)
+  - **Secondary LLM**: Google Gemini (`gemini-2.5-flash-lite` via `GEMINI_API_KEY`)
+  - **Final Evaluation Fallback**: OpenAI (`gpt-4o-mini` via `OPENAI_API_KEY`)
+- **Stack & Libraries**:
+  - **Core CLI (`assist.py`)**: Pure **Python 3.12** standard library + SQLite **FTS5** + **256-d** semantic vectors (`sqlite3`, `json`, `re`, `zoneinfo`, `urllib`). Optional persistent Qdrant adapter (`QdrantLocalVectorStore`).
+  - **Web UI**: **FastAPI** + **Pydantic** (`backend/api/`) and **React 18 + TypeScript + Vite + Tailwind CSS + Recharts** (`frontend/`).
+- **AI Coding Assistants Used**: Developed and verified with **Google DeepMind Antigravity** (used for architecture review, test-driven implementation, hidden-day stress testing, and edge-case hardening).
 
 ---
 
@@ -177,6 +207,7 @@ Select **Day 5 (`2026-11-06`)** and **`Meera Iyer (p02)`** (unless noted) to ver
 
 ```text
 ├── assist.py                  # Standalone Python 3.12 stdlib CLI entrypoint
+├── DESIGN_NOTE.md             # Required 1-page architecture & safety design note
 ├── .env                       # Pre-configured runtime & LLM keys (portable relative defaults)
 ├── .env.example               # Template reference
 ├── requirements.txt           # FastAPI Web UI backend dependencies
@@ -184,5 +215,5 @@ Select **Day 5 (`2026-11-06`)** and **`Meera Iyer (p02)`** (unless noted) to ver
 ├── src/                       # Core Python engine (ingest, claims, tasks, promises, ask, brief, memory, retrieval, security, llm, usage)
 ├── backend/api/               # Thin FastAPI adapter exposing src/ to Web UI
 ├── frontend/                  # React 18 + TypeScript + Vite + Tailwind CSS + Recharts UI ("WorkMate")
-└── tests/                     # 95 automated unit, integration, security, retrieval, and FastAPI tests
+└── tests/                     # 96 automated unit, integration, security, retrieval, and FastAPI tests
 ```

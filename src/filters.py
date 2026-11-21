@@ -69,6 +69,9 @@ BOILERPLATE_SENTENCES = frozenset(
         "two open questions remain on the payment flow.",
         "the analytics export is attached for reference.",
         "we will share a short recap after the call.",
+        "all metrics within normal range.",
+        "no change to plan.",
+        "all metrics within normal range. no change to plan.",
     }
 )
 
@@ -96,7 +99,32 @@ ROUTINE_CHITCHAT_BODIES = frozenset(
         "figma link updated",
         "who has the staging password? ask in #dev not here",
         "client call shifted by 15 min",
+        "anyone going to the weekly sync?",
+        "anyone has the brand fonts?",
+        "cake in pantry",
+        "can someone review my copy draft",
+        "done ✅",
+        "kal wfh hoon",
+        "ok noted",
+        "on it",
+        "pls check mail",
+        "reminder: timesheets by eod",
+        "thanks!",
+        "uploaded the new icons",
+        "will check and revert",
     }
+)
+
+ROUTINE_CHITCHAT_PATTERNS = (
+    re.compile(
+        r"^beam design system v[0-9.]+\s+(?:tokens released, update your libs|is out\. new button tokens\.)$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^pr #\d+\s+review kar do please$", re.IGNORECASE),
+    re.compile(r"^qa build \d+\s+ready$", re.IGNORECASE),
+    re.compile(r"^meeting room \d+\s+booked till \d+$", re.IGNORECASE),
+    re.compile(r"^standup \d+\s+min late$", re.IGNORECASE),
+    re.compile(r"^happy birthday\s+[a-z]+\s*!$", re.IGNORECASE),
 )
 
 _NEWSLETTER_LOCAL_PARTS = frozenset(
@@ -190,7 +218,7 @@ def classify_noise(record: dict[str, Any], sanitized_body: str) -> tuple[int, in
     is_boilerplate = 0
     if rtype == "notification":
         is_boilerplate = 1
-    elif low_body in ROUTINE_CHITCHAT_BODIES:
+    elif low_body in ROUTINE_CHITCHAT_BODIES or any(p.match(low_body) for p in ROUTINE_CHITCHAT_PATTERNS):
         is_boilerplate = 1
     elif rtype == "doc":
         meaningful = strip_boilerplate_lines(sanitized_body)

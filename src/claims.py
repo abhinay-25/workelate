@@ -472,6 +472,26 @@ def rebuild_claims(conn: sqlite3.Connection, llm_client: LLMClient | None = None
                     author=author,
                     readers_json=readers_json,
                 )
+            elif client and changed_here and old_val is not None and not fkey.startswith("cell_"):
+                _insert_claim(
+                    conn,
+                    org=org,
+                    client=client,
+                    subject_key=f"{client}:doc_field:{fkey}",
+                    predicate="field_update",
+                    object_val=val,
+                    old_val=str(old_val),
+                    source_kind="doc_changed_field",
+                    author_role=author_role,
+                    effective_at_utc=eff_utc,
+                    at_utc=at_utc,
+                    day=day,
+                    source_record_id=rid,
+                    feedback_id=None,
+                    visibility=vis,
+                    author=author,
+                    readers_json=readers_json,
+                )
 
     # 2. Extract claims from non-doc records (notes, mails, chats)
     recs = conn.execute(
@@ -1013,7 +1033,7 @@ def get_claim_changes_in_window(
             continue
 
         # Check if there was a prior distinct value or if this is a brand-new decision/handover
-        if winner["predicate"] in ("owner", "date", "decision"):
+        if winner["predicate"] in ("owner", "date", "decision", "field_update"):
             changes.append(
                 {
                     "subject_key": sk,

@@ -20,6 +20,40 @@ def _norm_key(raw_key: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", raw_key.strip().lower()).strip("_")
 
 
+def format_sheet_cells(cells_obj: dict[str, Any] | None) -> tuple[list[str], dict[str, str]]:
+    """Pair spreadsheet A{row}/B{row} labels with values and optional C1 unit string."""
+    if not isinstance(cells_obj, dict) or not cells_obj:
+        return [], {}
+
+    upper_cells = {str(k).strip().upper(): str(v).strip() for k, v in cells_obj.items() if str(v).strip()}
+    unit = ""
+    c1 = upper_cells.get("C1", "")
+    if c1 and not ("A1" in upper_cells and "B1" in upper_cells):
+        unit = c1
+
+    row_nums: list[int] = []
+    for k in upper_cells:
+        m = re.fullmatch(r"A(\d+)", k)
+        if m:
+            rn = int(m.group(1))
+            if f"B{rn}" in upper_cells and rn not in row_nums:
+                row_nums.append(rn)
+    row_nums.sort()
+
+    display_lines: list[str] = []
+    paired_kv: dict[str, str] = {}
+    for rn in row_nums:
+        lbl = upper_cells[f"A{rn}"]
+        val = upper_cells[f"B{rn}"]
+        full_val = f"{val} {unit}".strip() if unit else val
+        display_lines.append(f"{lbl}: {full_val}")
+        nk = _norm_key(lbl)
+        if nk:
+            paired_kv[nk] = full_val
+
+    return display_lines, paired_kv
+
+
 def extract_doc_kv(
     title: str | None,
     sanitized_body: str,
@@ -33,6 +67,8 @@ def extract_doc_kv(
             if isinstance(cells, dict):
                 for cell_k, cell_v in cells.items():
                     kv[f"cell_{str(cell_k).lower()}"] = str(cell_v)
+                _, paired_kv = format_sheet_cells(cells)
+                kv.update(paired_kv)
         except ValueError:
             pass
 

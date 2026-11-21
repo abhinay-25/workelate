@@ -8,7 +8,7 @@ from typing import Any
 from src.config import db_path, pack_root
 from src.claims import rebuild_claims
 from src.db import get_connection, get_ingested_days, mark_day_ingested, reset_db, set_meta
-from src.docs_engine import rebuild_doc_versions
+from src.docs_engine import format_sheet_cells, rebuild_doc_versions
 from src.entities import extract_entities_for_day
 from src.filters import classify_noise, sanitize_text
 from src.memory import process_feedback_for_day
@@ -163,6 +163,12 @@ def _normalize_record(
     to_list = rec.get("to")
     cells = rec.get("cells")
     attendees = rec.get("attendees")
+    title_val = rec.get("title") or rec.get("name")
+    if (rec.get("type") or "").strip().lower() == "sheet" and isinstance(cells, dict):
+        sheet_lines, _ = format_sheet_cells(cells)
+        if sheet_lines:
+            joined = "; ".join(sheet_lines)
+            sanitized_body = f"{sanitized_body.rstrip('.')}: {joined}." if sanitized_body else f"{joined}."
 
     return (
         rec["id"],
@@ -179,7 +185,7 @@ def _normalize_record(
         rec.get("channel"),
         json.dumps(to_list, ensure_ascii=False) if to_list is not None else None,
         subject,
-        rec.get("title"),
+        title_val,
         rec.get("doc_id"),
         rec.get("sheet_id"),
         rec.get("version"),

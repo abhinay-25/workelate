@@ -240,6 +240,8 @@ def _format_task_change(tc: dict[str, Any], people_map: dict[str, str]) -> dict[
 
 def _topic_label(subject_key: str, client_id: str | None) -> str:
     slug = subject_key.split(":", 1)[-1]
+    if slug.startswith("doc_field:"):
+        slug = slug.split(":", 1)[-1]
     if slug.endswith("_owner"):
         slug = slug[:-6]
     elif slug.endswith("_date"):
@@ -297,6 +299,23 @@ def _format_claim_change(
             "at_utc": eff_utc,
             "title": scope,
             "new_val": new_name,
+        }
+
+    if pred == "field_update":
+        label = topic.capitalize() if topic else "Field"
+        text = (
+            f"{label} updated from {old_val} to {obj_val}"
+            if old_val and old_val != obj_val
+            else f"{label} updated to {obj_val}"
+        )
+        return {
+            "text": text,
+            "sources": sources,
+            "prio": 1,
+            "kind": "status",
+            "at_utc": eff_utc,
+            "title": label,
+            "new_val": obj_val,
         }
 
     # pred == "date"

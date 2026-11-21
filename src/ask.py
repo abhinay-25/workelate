@@ -1567,6 +1567,35 @@ def answer_question(
             "usage": tracker.to_dict(),
         }
 
+    # Same-first-name ambiguity fallback when non-analytical query stays unresolved across clients
+    if not is_analytical:
+        ambig_person = resolve_person_mention(
+            conn,
+            person_id,
+            ask_text,
+            upto_day=current_day,
+            upto_utc=at_utc,
+            client_id=cid,
+            exclude_asker=False,
+        )
+        if ambig_person.get("ambiguous"):
+            opts = [
+                f"{pid}: {people_map[pid]['name']} ({people_map[pid]['role']})"
+                for pid in ambig_person.get("candidates") or []
+                if pid in people_map
+            ]
+            out = {
+                "answer": None,
+                "matched": [],
+                "clarify": {
+                    "question": f"Which {ambig_person.get('phrase') or 'person'} do you mean?",
+                    "options": opts,
+                },
+                "refused": None,
+                "usage": tracker.to_dict(),
+            }
+            return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
+
     # Selective LLM intent interpretation & general NL fallback when deterministic paths didn't resolve
     if not is_analytical and llm.configured_providers():
         intent_regex_hit = bool(

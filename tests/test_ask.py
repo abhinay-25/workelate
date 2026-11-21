@@ -507,6 +507,112 @@ class AskEngineTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_sheet_cells_single_noun_task_clarify_and_distractor_filtering(self):
+        for day in range(1, 6):
+            ingest_day(day)
+
+        conn = get_connection(self.db_file)
+        try:
+            # 1. Distractor / routine chitchat traps are quarantined as boilerplate
+            beam_bp = conn.execute(
+                "SELECT COUNT(*) FROM records WHERE is_boilerplate = 0 AND LOWER(sanitized_body) LIKE 'beam design system v%'"
+            ).fetchone()[0]
+            sync_bp = conn.execute(
+                "SELECT COUNT(*) FROM records WHERE is_boilerplate = 0 AND LOWER(sanitized_body) = 'anyone going to the weekly sync?'"
+            ).fetchone()[0]
+            self.assertEqual(beam_bp, 0)
+            self.assertEqual(sync_bp, 0)
+
+            # 2. Planted Day 1 spreadsheets (s-nb-rev, s-cl-budget) are deterministically answerable
+            rev = answer_question(
+                conn, "p02", "2026-11-06T18:00:00Z", "What was Northbeam's October revenue?"
+            )
+            self.assertIn("42.0", rev["answer"]["text"])
+            self.assertIn("INR lakh", rev["answer"]["text"])
+            self.assertIn("rq0pu1dc", rev["answer"]["sources"])
+            self.assertEqual(rev["usage"]["input_tokens"], 0)
+
+            bud = answer_question(
+                conn, "p02", "2026-11-06T18:00:00Z", "How much of the Cobaltline budget is spent?"
+            )
+            self.assertIn("18.2", bud["answer"]["text"])
+            self.assertIn("rb8gqqru", bud["answer"]["sources"])
+            self.assertEqual(bud["usage"]["input_tokens"], 0)
+
+            # 3. Single-noun task ambiguity across clients -> clarify t-cl-05 & t-ap-01; client-scoped -> direct answer
+            cl_rep = answer_question(conn, "p02", "2026-11-06T18:00:00Z", "Is the report done?")
+            self.assertIsNone(cl_rep["answer"])
+            self.assertIsNotNone(cl_rep["clarify"])
+            opts_joined = " | ".join(cl_rep["clarify"]["options"])
+            self.assertIn("t-cl-05", opts_joined)
+            self.assertIn("t-ap-01", opts_joined)
+
+            ap_rep = answer_question(conn, "p02", "2026-11-06T18:00:00Z", "Is the Alderpoint report done?")
+            self.assertIsNone(ap_rep["clarify"])
+            self.assertIn("November monthly report", ap_rep["answer"]["text"])
+            self.assertEqual(ap_rep["usage"]["input_tokens"], 0)
+
+            # Ambiguous first name without client/collaboration tie-breaker -> clarify both matching people
+            arjun_q = answer_question(conn, "p02", "2026-11-06T18:00:00Z", "What team is Arjun on?")
+            self.assertIsNone(arjun_q["answer"])
+            self.assertIsNotNone(arjun_q["clarify"])
+            arjun_opts = " | ".join(arjun_q["clarify"]["options"])
+            self.assertIn("p11", arjun_opts)
+            self.assertIn("p23", arjun_opts)
+
+            # 4. Updating spreadsheet s-cl-budget to v2 emits a brief diff on subsequent meeting
+            from src.brief import generate_briefs_for_person_date
+            from src.claims import rebuild_claims
+            from src.db import mark_day_ingested
+            from src.docs_engine import rebuild_doc_versions
+
+            cells_v2 = json.dumps(
+                {"A2": "Approved", "B2": "25.0", "A3": "Spent", "B3": "21.5", "C1": "INR lakh"}
+            )
+            body_v2 = "Cobaltline budget: Approved: 25.0 INR lakh; Spent: 21.5 INR lakh."
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, title, sheet_id, version, cells_json, body, sanitized_body,
+                    has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_sheet_v2', 6, 1, 'org_kp', 'sheet', '2026-11-07T04:00:00Z', '2026-11-07',
+                    'p21', 'cobaltline', 'team', 'Cobaltline budget', 's-cl-budget', 2, ?, ?, ?,
+                    0, 0, 0, 0
+                )
+                """,
+                (cells_v2, body_v2, body_v2),
+            )
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, event_id, start_utc, attendees_json, title, body, sanitized_body,
+                    has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_ev_cl_7', 6, 2, 'org_kp', 'event', '2026-11-07T05:00:00Z', '2026-11-07',
+                    'p03', 'cobaltline', 'team', 'ev-cl-ro-07', '2026-11-08T05:00:00Z', '["p03"]',
+                    'Cobaltline status check-in', 'Cobaltline status check-in', 'Cobaltline status check-in',
+                    0, 0, 0, 0
+                )
+                """,
+            )
+            rebuild_doc_versions(conn)
+            rebuild_claims(conn)
+            mark_day_ingested(conn, 6)
+            conn.execute("DELETE FROM brief_cache")
+            conn.commit()
+
+            briefs_d6 = generate_briefs_for_person_date(conn, "p03", "2026-11-08")
+            self.assertEqual(len(briefs_d6), 1)
+            ch_texts = " ".join(c["text"] for c in briefs_d6[0]["changed"])
+            self.assertIn("18.2", ch_texts)
+            self.assertIn("21.5", ch_texts)
+            self.assertIn("r_sheet_v2", [s for c in briefs_d6[0]["changed"] for s in c["sources"]])
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
