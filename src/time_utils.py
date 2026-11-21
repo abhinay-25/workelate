@@ -137,6 +137,47 @@ def resolve_query_weekday(weekday_name: str, ref_utc: str, zone_name: str | None
     return (base + timedelta(days=days_ahead)).isoformat()
 
 
+def resolve_relative_past_window(text: str, ref_utc: str, zone_name: str | None) -> tuple[str, str] | None:
+    """Resolve retrospective calendar ranges ('yesterday', 'last week', 'past N days') in the asker's timezone."""
+    low = (text or "").lower()
+    if not low.strip():
+        return None
+    try:
+        local_today = utc_to_local_dt(ref_utc, zone_name).date()
+    except (ValueError, TypeError):
+        return None
+
+    if re.search(r"\byesterday\b", low):
+        yday = (local_today - timedelta(days=1)).isoformat()
+        return yday, yday
+
+    if re.search(r"\b(?:last|previous)\s+week\b|\bpichle\s+hafte\b", low):
+        this_monday = local_today - timedelta(days=local_today.weekday())
+        last_monday = this_monday - timedelta(days=7)
+        last_sunday = this_monday - timedelta(days=1)
+        return last_monday.isoformat(), last_sunday.isoformat()
+
+    m_days = re.search(r"\b(?:last|past)\s+(\d{1,2})\s+days?\b", low)
+    if m_days:
+        n_days = int(m_days.group(1))
+        if 1 <= n_days <= 30:
+            start_d = (local_today - timedelta(days=n_days)).isoformat()
+            return start_d, local_today.isoformat()
+
+    return None
+
+
+def utc_in_local_date_window(at_utc: str, zone_name: str | None, start_date: str, end_date: str) -> bool:
+    """Return True if at_utc falls within [start_date, end_date] in the given timezone."""
+    if not at_utc:
+        return False
+    try:
+        local_d = utc_to_local_date(at_utc, zone_name)
+    except (ValueError, TypeError):
+        return False
+    return start_date <= local_d <= end_date
+
+
 def parse_explicit_date(text: str, default_year: int, default_month: int | None = None) -> str | None:
     """Parse explicit day/month strings like '14 Nov 2026', 'Nov 14', or 'the 12th'."""
     low = (text or "").lower()

@@ -613,6 +613,93 @@ class AskEngineTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_retrospective_last_week_and_yesterday_respect_asker_timezone(self):
+        from src.db import mark_day_ingested
+        from src.promises import rebuild_promises
+        from src.time_utils import resolve_relative_past_window
+
+        for day in range(1, 6):
+            ingest_day(day)
+
+        # Cross-midnight UTC instant: 2026-11-08T20:00:00Z
+        # -> Europe/London is still Sunday 2026-11-08 (last week: Oct 26..Nov 1; yesterday: Nov 7)
+        # -> Asia/Kolkata is Monday 2026-11-09 01:30 IST (last week: Nov 2..Nov 8; yesterday: Nov 8)
+        ref_utc = "2026-11-08T20:00:00Z"
+        self.assertEqual(resolve_relative_past_window("What changed last week?", ref_utc, "Europe/London"), ("2026-10-26", "2026-11-01"))
+        self.assertEqual(resolve_relative_past_window("What changed last week?", ref_utc, "Asia/Kolkata"), ("2026-11-02", "2026-11-08"))
+        self.assertEqual(resolve_relative_past_window("What changed yesterday?", ref_utc, "Europe/London"), ("2026-11-07", "2026-11-07"))
+        self.assertEqual(resolve_relative_past_window("What changed yesterday?", ref_utc, "Asia/Kolkata"), ("2026-11-08", "2026-11-08"))
+        self.assertIsNone(resolve_relative_past_window("Write an executive summary for this week.", ref_utc, "Europe/London"))
+
+        conn = get_connection(self.db_file)
+        try:
+            # p25 (Europe/London, Sunday 2026-11-08): Nov 2-6 is current week, so "last week" has no records -> abstain
+            out_london_lw = answer_question(conn, "p25", ref_utc, "What changed last week?")
+            self.assertEqual(out_london_lw["answer"]["text"], "I have nothing on that.")
+            self.assertEqual(out_london_lw["answer"]["sources"], [])
+
+            # p03 (Asia/Kolkata, Monday 2026-11-09): Nov 2-6 falls inside "last week" (2026-11-02..2026-11-08)
+            out_ist_lw = answer_question(conn, "p03", ref_utc, "What changed last week?")
+            self.assertGreater(len(out_ist_lw["answer"]["sources"]), 0)
+            self.assertIn("2026-11-02 to 2026-11-08", out_ist_lw["answer"]["text"])
+
+            # Insert Day 6 records on 2026-11-08T09:00Z (yesterday for IST at 2026-11-08T20:00Z, today for London)
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, subject, body, sanitized_body,
+                    has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_yday_p03', 6, 1, 'org_kp', 'mail', '2026-11-08T09:00:00Z', '2026-11-08',
+                    'p03', 'northbeam', 'team', 'Weekend check',
+                    'Confirmed staging firewall update; I will send the staging audit checklist by Tuesday.',
+                    'Confirmed staging firewall update; I will send the staging audit checklist by Tuesday.',
+                    0, 0, 0, 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, body, sanitized_body,
+                    has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_yday_p02', 6, 2, 'org_kp', 'chat', '2026-11-08T10:00:00Z', '2026-11-08',
+                    'p02', 'cobaltline', 'team',
+                    'I will share the revised carrier matrix tomorrow.',
+                    'I will share the revised carrier matrix tomorrow.',
+                    0, 0, 0, 0
+                )
+                """
+            )
+            rebuild_promises(conn)
+            mark_day_ingested(conn, 6)
+            conn.commit()
+
+            # Yesterday for p25 (London) is 2026-11-07 -> no records -> abstain
+            out_london_y = answer_question(conn, "p25", ref_utc, "What changed yesterday?")
+            self.assertEqual(out_london_y["answer"]["text"], "I have nothing on that.")
+            self.assertEqual(out_london_y["answer"]["sources"], [])
+
+            # Yesterday for p03 (IST) is 2026-11-08 -> grounded summary citing Day 6 records only
+            out_ist_y = answer_question(conn, "p03", ref_utc, "What changed yesterday?")
+            self.assertEqual(set(out_ist_y["answer"]["sources"]) <= {"r_yday_p03", "r_yday_p02"}, True)
+            self.assertGreater(len(out_ist_y["answer"]["sources"]), 0)
+
+            # "What did I promise yesterday?" scopes strictly to p03 + p03's local yesterday (excludes p02 & Days 1-5)
+            out_ist_prom = answer_question(conn, "p03", ref_utc, "What did I promise yesterday?")
+            self.assertEqual(out_ist_prom["answer"]["sources"], ["r_yday_p03"])
+            self.assertIn("staging audit checklist", out_ist_prom["answer"]["text"])
+
+            # London p25 made no promise on London's yesterday (2026-11-07) -> abstain cleanly
+            out_london_prom = answer_question(conn, "p25", ref_utc, "What did I promise yesterday?")
+            self.assertEqual(out_london_prom["answer"]["text"], "I have nothing on that.")
+            self.assertEqual(out_london_prom["answer"]["sources"], [])
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

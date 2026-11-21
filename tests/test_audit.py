@@ -96,6 +96,45 @@ class AuditCommandTests(unittest.TestCase):
         self.assertNotIn("rjuznjge", serialized)
         self.assertNotIn("Dubai", serialized)
 
+    def test_audit_hides_expired_leave_claims_once_date_passes(self):
+        from src.db import mark_day_ingested
+
+        for d in range(1, 6):
+            ingest_day(d)
+
+        conn = get_connection(self.db_file)
+        try:
+            # On Day 5 (2026-11-06), Day 3 leave claim (valid_until=2026-11-11) is active/upcoming
+            a_d5 = audit_for_person(conn, "p02")
+            keys_d5 = {c["subject_key"] for c in a_d5["claims"]}
+            self.assertIn("p04:availability", keys_d5)
+
+            # Advance ingested timeline to 2026-11-13 (Day 6) past valid_until=2026-11-11
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, body, sanitized_body,
+                    has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_day13_ping', 6, 1, 'org_kp', 'chat', '2026-11-13T10:00:00Z', '2026-11-13',
+                    'p02', NULL, 'team', 'Checking weekly ops status.', 'Checking weekly ops status.',
+                    0, 0, 0, 0
+                )
+                """
+            )
+            mark_day_ingested(conn, 6)
+            conn.commit()
+
+            a_after = audit_for_person(conn, "p02")
+            keys_after = {c["subject_key"] for c in a_after["claims"]}
+            self.assertNotIn("p04:availability", keys_after)
+            # Non-expiring operational claims remain intact
+            self.assertIn("northbeam:billing_owner", keys_after)
+            self.assertIn("northbeam:launch_date", keys_after)
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

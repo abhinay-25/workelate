@@ -18,6 +18,7 @@ from src.security import (
     visible_records_where_clause,
 )
 from src.tasks_engine import get_visible_tasks_at
+from src.time_utils import utc_to_local_date
 
 
 def _filter_visible_record_ids(
@@ -65,6 +66,16 @@ def audit_for_person(conn: sqlite3.Connection, person_id: str) -> dict[str, Any]
     kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
     tainted = _tainted_phrases(conn)
 
+    latest_row = conn.execute(
+        "SELECT MAX(at_utc) AS max_utc FROM records WHERE day <= ?",
+        (current_day,),
+    ).fetchone()
+    current_local_date = (
+        utc_to_local_date(str(latest_row["max_utc"]), str(person_row["zone"]))
+        if latest_row and latest_row["max_utc"]
+        else None
+    )
+
     profile = {
         "person_id": person_id,
         "name": str(person_row["name"]),
@@ -89,7 +100,13 @@ def audit_for_person(conn: sqlite3.Connection, person_id: str) -> dict[str, Any]
     claims_out: list[dict[str, Any]] = []
     for row in subj_rows:
         sk = str(row["subject_key"])
-        win = get_winning_claim(conn, person_id, sk, upto_day=current_day)
+        win = get_winning_claim(
+            conn,
+            person_id,
+            sk,
+            upto_day=current_day,
+            query_date=current_local_date,
+        )
         if not win:
             continue
         blob = f"{win['subject_key']} {win['object_val']}"

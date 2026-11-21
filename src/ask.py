@@ -6,7 +6,7 @@ import sqlite3
 from datetime import date
 from typing import Any
 
-from src.claims import get_winning_claim
+from src.claims import get_claim_changes_in_window, get_winning_claim
 from src.entities import (
     resolve_artifact_mention,
     resolve_client_mention,
@@ -34,10 +34,13 @@ from src.security import (
 )
 from src.tasks_engine import get_task_state_at, get_visible_tasks_at
 from src.time_utils import (
+    DEFAULT_ZONE,
     WEEKDAYS,
     parse_explicit_date,
     resolve_query_weekday,
     resolve_relative_due_date,
+    resolve_relative_past_window,
+    utc_in_local_date_window,
     utc_to_local_date,
 )
 from src.usage import ASK_TOKEN_LIMIT, UsageTracker, pack_records_within_budget
@@ -627,6 +630,8 @@ def _gather_analytical_evidence(
     query_local_date: str,
     hybrid_hits: list[dict[str, Any]],
     limit: int = 10,
+    past_window: tuple[str, str] | None = None,
+    person_zone: str = DEFAULT_ZONE,
 ) -> tuple[list[sqlite3.Row], str]:
     """Gather authorized, non-forgotten, non-tainted evidence records + state summary for LLM synthesis."""
     kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
@@ -643,6 +648,10 @@ def _gather_analytical_evidence(
         if int(rec["day"]) > upto_day or int(rec["is_forgotten"]) != 0:
             return False
         if str(rec["at_utc"]) > upto_utc:
+            return False
+        if past_window is not None and not utc_in_local_date_window(
+            str(rec["at_utc"]), person_zone, past_window[0], past_window[1]
+        ):
             return False
         if int(rec["is_boilerplate"]) != 0 or int(rec["is_newsletter"]) != 0:
             return False
@@ -800,6 +809,8 @@ def _search_and_synthesize_fallback(
     query_local_date: str | None = None,
     clients_map: dict[str, str] | None = None,
     task_matches: list[dict[str, Any]] | None = None,
+    past_window: tuple[str, str] | None = None,
+    person_zone: str = DEFAULT_ZONE,
 ) -> dict[str, Any] | None:
     """Search visible non-forgotten non-boilerplate records and synthesize concisely (LLM if configured)."""
     where = visible_records_where_clause("r", with_utc_cutoff=True)
@@ -827,6 +838,15 @@ def _search_and_synthesize_fallback(
         if not rows:
             return None
 
+    if past_window is not None:
+        start_d, end_d = past_window
+        rows = [
+            r for r in rows
+            if utc_in_local_date_window(str(r["at_utc"]), person_zone, start_d, end_d)
+        ]
+        if not rows:
+            return None
+
     other_res = resolve_person_mention(
         conn, person_id, ask_text, upto_day=upto_day, upto_utc=upto_utc, exclude_asker=True
     )
@@ -847,6 +867,7 @@ def _search_and_synthesize_fallback(
     min_base_hits = 2 if len(base_terms) >= 2 else 1
 
     # Hybrid retrieval combining FTS5 BM25 keyword search + dense semantic vectors
+    hybrid_limit = 20 if past_window is not None else (8 if force_llm else 6)
     hybrid_hits = search_hybrid(
         conn,
         person_id,
@@ -857,11 +878,19 @@ def _search_and_synthesize_fallback(
         synonyms=_TOPIC_SYNONYMS,
         upto_day=upto_day,
         upto_utc=upto_utc,
-        limit=8 if force_llm else 6,
+        limit=hybrid_limit,
         target_author=target_author,
         asks_self=asks_self,
         tracker=tracker,
     )
+    if past_window is not None:
+        start_d, end_d = past_window
+        target_hits = 8 if force_llm else 6
+        hybrid_hits = [
+            h for h in hybrid_hits
+            if h.get("record") is not None
+            and utc_in_local_date_window(str(h["record"]["at_utc"]), person_zone, start_d, end_d)
+        ][:target_hits]
 
     _SAFE_WORKPLACE_UNMAPPED = frozenset(
         {
@@ -911,6 +940,8 @@ def _search_and_synthesize_fallback(
             query_local_date or at_utc_to_date(upto_utc),
             hybrid_hits,
             limit=10,
+            past_window=past_window,
+            person_zone=person_zone,
         )
         if not top_recs:
             return None
@@ -982,7 +1013,14 @@ def _search_and_synthesize_fallback(
     # Use live LLM chain when analytical synthesis is requested, explicitly requested, or prose > 3 sentences
     if (force_llm or explicit_llm or len(sentences) > 3) and llm_client.configured_providers():
         sys_prompt = _ASK_ANALYTICAL_SYSTEM_PROMPT if force_llm else _ASK_SYSTEM_PROMPT
-        user_prefix = f"Question from {person_id} at {upto_utc}: {ask_text}"
+        tz_ctx = ""
+        if past_window is not None:
+            loc_d = query_local_date or at_utc_to_date(upto_utc)
+            tz_ctx = (
+                f" (asker timezone: {person_zone}, local date: {loc_d}, "
+                f"requested window: {past_window[0]} to {past_window[1]})"
+            )
+        user_prefix = f"Question from {person_id} at {upto_utc}{tz_ctx}: {ask_text}"
         if state_context:
             user_prefix += f"\n\nVerified State Summary (authoritative ACL-filtered context):\n{state_context}"
         user_prompt, cnt = pack_records_within_budget(
@@ -1104,6 +1142,139 @@ def _has_unknown_noncorpus_topic(
 
 def at_utc_to_date(at_utc: str) -> str:
     return str(at_utc or "")[:10]
+
+
+def _handle_past_window_summary(
+    conn: sqlite3.Connection,
+    person_id: str,
+    person_org: str,
+    person_zone: str,
+    ask_text: str,
+    client_res: dict[str, Any],
+    people_map: dict[str, sqlite3.Row],
+    clients_map: dict[str, str],
+    upto_day: int,
+    upto_utc: str,
+    query_local_date: str,
+    past_window: tuple[str, str],
+    tracker: UsageTracker,
+) -> dict[str, Any] | None:
+    """Summarize authorized claim changes and substantive records inside asker's local past_window."""
+    start_d, end_d = past_window
+    cid = client_res.get("client_id")
+    extra_ignore = _client_ignore_tokens(conn, person_org, cid, client_res.get("phrase"))
+    kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
+    tainted = _tainted_phrases(conn)
+    where = visible_records_where_clause("r", with_utc_cutoff=True)
+    params = visible_records_params(person_id, person_org, upto_day, upto_utc)
+
+    raw_rows = conn.execute(
+        f"""
+        SELECT r.*
+        FROM records r
+        WHERE r.is_boilerplate = 0
+          AND r.is_newsletter = 0
+          AND r.type != 'event'
+          AND TRIM(COALESCE(r.sanitized_body, '')) != ''
+          AND {where}
+        ORDER BY r.at_utc DESC
+        """,
+        params,
+    ).fetchall()
+
+    other_res = resolve_person_mention(
+        conn, person_id, ask_text, upto_day=upto_day, upto_utc=upto_utc, client_id=cid, exclude_asker=True
+    )
+    target_pid = other_res.get("person_id")
+
+    safe_rows: list[sqlite3.Row] = []
+    for rec in raw_rows:
+        rid = str(rec["id"])
+        if rid in forgotten_ids or not can_view(rec, person_id, person_org):
+            continue
+        if not utc_in_local_date_window(str(rec["at_utc"]), person_zone, start_d, end_d):
+            continue
+        if cid and not _record_matches_client(conn, person_org, rec, cid, extra_ignore):
+            continue
+        if target_pid and str(rec["author"]) != target_pid:
+            continue
+        body = str(rec["sanitized_body"] or "").strip()
+        blob = f"{rec['title'] or ''} {rec['subject'] or ''} {body}"
+        if _text_matches_forgotten(blob, kw_groups) or _text_echoes_tainted_phrase(blob, tainted):
+            continue
+        safe_rows.append(rec)
+
+    in_window_map = {str(r["id"]): r for r in safe_rows}
+    all_srcs: list[str] = []
+    items: list[str] = []
+
+    if not target_pid:
+        changes = get_claim_changes_in_window(
+            conn,
+            person_id,
+            cid,
+            upto_day=upto_day,
+            upto_utc=upto_utc,
+            query_date=query_local_date,
+        )
+        for ch in changes:
+            if not utc_in_local_date_window(str(ch["effective_at_utc"]), person_zone, start_d, end_d):
+                continue
+            csrcs = [str(s) for s in (ch.get("sources") or []) if str(s) in in_window_map]
+            if not csrcs:
+                continue
+            sk = str(ch["subject_key"])
+            cblob = f"{sk} {ch['object_val']}"
+            if _text_matches_forgotten(cblob, kw_groups) or _text_echoes_tainted_phrase(cblob, tainted):
+                continue
+            val_disp = str(ch["object_val"])
+            if ch.get("predicate") == "owner":
+                _, val_disp = _format_owner_name(val_disp, people_map)
+            items.append(f"{sk} -> {val_disp}")
+            if csrcs[0] not in all_srcs:
+                all_srcs.append(csrcs[0])
+            if len(items) >= 4:
+                break
+
+    for rec in safe_rows:
+        if len(items) >= 4:
+            break
+        rid = str(rec["id"])
+        if rid in all_srcs:
+            continue
+        body = " ".join(str(rec["sanitized_body"] or "").split())
+        if len(body) > 140:
+            body = body[:137].rstrip() + "..."
+        items.append(body)
+        all_srcs.append(rid)
+
+    if not items or not all_srcs:
+        return None
+
+    win_label = start_d if start_d == end_d else f"{start_d} to {end_d}"
+    matched_list: list[dict[str, Any]] = []
+    if cid:
+        cli_srcs = _safe_matched_sources(
+            conn, client_res.get("sources"), person_id, person_org, upto_day, upto_utc
+        )
+        matched_list.append(
+            {
+                "phrase": client_res.get("phrase") or clients_map.get(cid, cid),
+                "id": cid,
+                "sources": cli_srcs,
+            }
+        )
+
+    return {
+        "answer": {
+            "text": f"Updates for {win_label} ({person_zone}): " + "; ".join(items) + ".",
+            "sources": all_srcs,
+        },
+        "matched": matched_list,
+        "clarify": None,
+        "refused": None,
+        "usage": tracker.to_dict(),
+    }
 
 
 def _llm_interpret_question_intent(
@@ -1241,6 +1412,7 @@ def answer_question(
     person_org = str(person_row["org_id"])
     person_zone = str(person_row["zone"])
     query_local_date = utc_to_local_date(at_utc, person_zone)
+    past_window = resolve_relative_past_window(ask_text, at_utc, person_zone)
     people_map = _load_org_people(conn, person_org)
     clients_map = _load_org_clients(conn, person_org)
     llm = llm_client or LLMClient()
@@ -1503,6 +1675,17 @@ def answer_question(
         tpid = target_person.get("person_id")
         if tpid:
             promises = [p for p in promises if p["owner"] == tpid]
+        elif re.search(r"\b(?:did\s+i|have\s+i|i\s+promis\w*|my\s+promis\w*)\b", low_q):
+            promises = [p for p in promises if p["owner"] == person_id]
+        if past_window is not None:
+            start_d, end_d = past_window
+            if re.search(r"\b(?:due|deadline)\s+(?:yesterday|(?:last|previous)\s+week|(?:last|past)\s+\d{1,2}\s+days?|pichle\s+hafte)\b", low_q):
+                promises = [p for p in promises if start_d <= str(p["due"]) <= end_d]
+            else:
+                promises = [
+                    p for p in promises
+                    if utc_in_local_date_window(str(p["at_utc"]), person_zone, start_d, end_d)
+                ]
         if promises:
             all_srcs: list[str] = []
             parts: list[str] = []
@@ -1521,6 +1704,30 @@ def answer_question(
             }
             return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
 
+    # Step 8.5: Retrospective changes / activity within asker's local past_window
+    if (
+        past_window is not None
+        and not is_analytical
+        and re.search(r"\b(?:changed|changes?|happened|decided|decisions?|updates?|activity|discussed)\b", low_q)
+    ):
+        pw_resp = _handle_past_window_summary(
+            conn,
+            person_id,
+            person_org,
+            person_zone,
+            ask_text,
+            client_res,
+            people_map,
+            clients_map,
+            current_day,
+            at_utc,
+            query_local_date,
+            past_window,
+            tracker,
+        )
+        if pw_resp:
+            return validate_ask_response(conn, pw_resp, person_id, current_day=current_day, at_utc=at_utc)
+
     # Step 9: Visible record search & selective LLM synthesis/analytical fallback
     fallback = _search_and_synthesize_fallback(
         conn,
@@ -1538,6 +1745,8 @@ def answer_question(
         query_local_date=query_local_date,
         clients_map=clients_map,
         task_matches=task_matches,
+        past_window=past_window,
+        person_zone=person_zone,
     )
     # Boolean-only check for restricted/private org records matching non-client topic terms
     ignore_cli_words = {
@@ -1597,7 +1806,7 @@ def answer_question(
             return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
 
     # Selective LLM intent interpretation & general NL fallback when deterministic paths didn't resolve
-    if not is_analytical and llm.configured_providers():
+    if not is_analytical and past_window is None and llm.configured_providers():
         intent_regex_hit = bool(
             re.search(
                 r"\b(?:owner|handles?|billing|invoic\w*|launch|release|go[\s-]?live|due|deadline|"
@@ -1647,6 +1856,8 @@ def answer_question(
                     query_local_date=query_local_date,
                     clients_map=clients_map,
                     task_matches=task_matches,
+                    past_window=past_window,
+                    person_zone=person_zone,
                 )
                 if nl_fallback:
                     nl_fallback.pop("_semantic_only", None)
