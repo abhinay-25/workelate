@@ -94,6 +94,18 @@ _DELIVERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_COMPLETED_DELIVERY_CUE_RE = re.compile(
+    r"\b(?:attached|attaching|shared|sent|sending|uploaded|delivered|here\s+is|here(?:'s|\s+are)|"
+    r"completed|finalized|bhej\s+d(?:i|ee|iy[ae])|share\s+kar\s+d(?:i|ee|iy[ae])|upload\s+kar\s+d(?:i|ee|iy[ae]))\b",
+    re.IGNORECASE,
+)
+
+_NON_DELIVERY_GUARD_RE = re.compile(
+    r"\b(?:waiting\s+on|still\s+need|pending|overdue|blocked|haven['’]t|have\s+not|"
+    r"not\s+yet|will\s+(?:send|share|deliver|upload)|tomorrow|kal\s+tak|by\s+friday|by\s+monday)\b",
+    re.IGNORECASE,
+)
+
 
 def normalize_deliverable(what: str) -> str:
     """Normalize a deliverable phrase for matching promises to deliveries."""
@@ -256,6 +268,36 @@ def extract_delivery_from_text(sanitized_body: str) -> str | None:
     return None
 
 
+def _match_open_promise_delivery(
+    sanitized_body: str,
+    subject: str | None,
+    open_norms: list[str],
+) -> list[str]:
+    """Match natural completed-delivery messages (e.g. 'Attached X', 'Sent X') against open promises."""
+    if not open_norms:
+        return []
+    body = " ".join((sanitized_body or "").strip().split())
+    if not body or "?" in body:
+        return []
+    if _is_interrogative_or_non_commitment(body):
+        return []
+    if _PROMISE_CUE_RE.search(body) or extract_promise_from_text(body, subject=subject):
+        return []
+    if _NON_DELIVERY_GUARD_RE.search(body):
+        return []
+    if not _COMPLETED_DELIVERY_CUE_RE.search(body):
+        return []
+
+    blob = f"{subject or ''} {body}".lower()
+    matched: list[str] = []
+    for wnorm in open_norms:
+        if len(wnorm) < 4:
+            continue
+        if re.search(r"(?<![a-z0-9])" + re.escape(wnorm) + r"(?![a-z0-9])", blob):
+            matched.append(wnorm)
+    return matched
+
+
 def rebuild_promises(conn: sqlite3.Connection, llm_client: LLMClient | None = None) -> None:
     """Recompute all promises and delivery closures chronologically from active records."""
     conn.execute("DELETE FROM promises")
@@ -299,6 +341,27 @@ def rebuild_promises(conn: sqlite3.Connection, llm_client: LLMClient | None = No
             pids = open_by_key.get((org, client, dnorm), [])
             if pids:
                 for pid in pids:
+                    conn.execute(
+                        """
+                        UPDATE promises
+                        SET status = 'fulfilled',
+                            fulfilled_by_record_id = ?,
+                            fulfilled_at_utc = ?
+                        WHERE promise_id = ?
+                        """,
+                        (rid, at_utc, pid),
+                    )
+                open_by_key[(org, client, dnorm)] = []
+            continue
+
+        client_open_norms = [
+            wn for (o, c, wn), pids in open_by_key.items()
+            if o == org and c == client and pids
+        ]
+        matched_norms = _match_open_promise_delivery(body, rec["subject"], client_open_norms)
+        if matched_norms:
+            for dnorm in matched_norms:
+                for pid in open_by_key.get((org, client, dnorm), []):
                     conn.execute(
                         """
                         UPDATE promises

@@ -122,6 +122,85 @@ class TestTasksAndPromisesPack(unittest.TestCase):
         )
         self.assertEqual({d["record_id"] for d in deliveries}, {"rt0g56zv", "r69jj1uk"})
 
+    def test_natural_delivery_closes_open_promise_without_false_positives(self) -> None:
+        import shutil
+        from src.promises import _match_open_promise_delivery, rebuild_promises
+
+        # Verify natural delivery cues close open deliverables only when not pending/question/future
+        self.assertEqual(
+            _match_open_promise_delivery(
+                "Attached the revised media budget for client sign-off.",
+                "Revised media budget",
+                ["revised media budget"],
+            ),
+            ["revised media budget"],
+        )
+        self.assertEqual(
+            _match_open_promise_delivery(
+                "Still waiting on the revised media budget from client.",
+                "Revised media budget",
+                ["revised media budget"],
+            ),
+            [],
+        )
+        self.assertEqual(
+            _match_open_promise_delivery(
+                "Did you share the revised media budget?",
+                None,
+                ["revised media budget"],
+            ),
+            [],
+        )
+
+        # Isolated DB copy so shared TestTasksAndPromisesPack fixture remains untouched
+        with tempfile.TemporaryDirectory() as iso_dir:
+            iso_db = os.path.join(iso_dir, "iso_tp.db")
+            shutil.copy2(self.db_file, iso_db)
+            iso_conn = get_connection(iso_db)
+            try:
+                iso_conn.execute(
+                    """
+                    INSERT INTO records(
+                        id, day, line_no, org, type, at_utc, local_date, author, client,
+                        visibility, body, sanitized_body, has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                    ) VALUES (
+                        'r_p6_open', 6, 1, 'org_kp', 'chat', '2026-11-07T05:00:00Z', '2026-11-07',
+                        'p07', 'northbeam', 'team',
+                        'I''ll send the revised media budget by Wednesday.',
+                        'I''ll send the revised media budget by Wednesday.',
+                        0, 0, 0, 0
+                    )
+                    """
+                )
+                iso_conn.execute(
+                    """
+                    INSERT INTO records(
+                        id, day, line_no, org, type, at_utc, local_date, author, client,
+                        visibility, subject, body, sanitized_body, has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                    ) VALUES (
+                        'r_p7_att', 7, 1, 'org_kp', 'mail', '2026-11-08T08:00:00Z', '2026-11-08',
+                        'p07', 'northbeam', 'team', 'Revised media budget',
+                        'Attached the revised media budget for client sign-off.',
+                        'Attached the revised media budget for client sign-off.',
+                        0, 0, 0, 0
+                    )
+                    """
+                )
+                rebuild_promises(iso_conn)
+                iso_conn.commit()
+                open_d6 = [
+                    p for p in get_open_promises(iso_conn, "p02", "northbeam", upto_day=6)
+                    if "media budget" in p["what"].lower()
+                ]
+                open_d7 = [
+                    p for p in get_open_promises(iso_conn, "p02", "northbeam", upto_day=7)
+                    if "media budget" in p["what"].lower()
+                ]
+                self.assertEqual(len(open_d6), 1)
+                self.assertEqual(open_d7, [])
+            finally:
+                iso_conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

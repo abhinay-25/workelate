@@ -31,7 +31,12 @@ _FORGET_STOP_WORDS = frozenset(
     }
 )
 
-_MAX_CHANGED_RE = re.compile(r"\b(?:max|at\s+most|up\s+to|limit\s+to)\s+(\d+)\s+changes?\b", re.IGNORECASE)
+_MAX_CHANGED_RE = re.compile(
+    r"\b(?:max(?:imum)?|at\s+most|up\s+to|limit(?:ed)?\s+to|no\s+more\s+than|"
+    r"keep\s+(?:it|briefs?)\s+to(?:\s+at\s+most)?)\s+(\d+)\s+"
+    r"(?:changes?|items?|bullets?|points?|lines?|updates?)\b",
+    re.IGNORECASE,
+)
 
 _OWNERSHIP_CORR_RE = re.compile(
     r"(?:no,?\s*)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:now\s+)?(?:owns|handles)\s+"
@@ -90,7 +95,12 @@ def _parse_preference(
     if "most important first" in low:
         prefs.append(("most_important_first", "true"))
 
-    if "blockers first" in low or "blocker first" in low or "prioritize blockers" in low:
+    if re.search(
+        r"\b(?:blockers?\s+first|prioritize\s+blockers?|"
+        r"blocked\s+(?:items?|tasks?)\s+first|"
+        r"(?:put|show|list|keep)\s+(?:blocked\s+(?:items?|tasks?)|blockers?)\s+(?:at\s+the\s+(?:very\s+)?)?top)\b",
+        low,
+    ):
         prefs.append(("blockers_first", "true"))
 
     if not prefs:

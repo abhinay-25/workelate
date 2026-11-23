@@ -700,6 +700,140 @@ class AskEngineTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_non_billing_feedback_hinglish_naya_and_doc_v3_rollback(self):
+        from src.brief import generate_briefs_for_person_date
+        from src.claims import rebuild_claims
+        from src.db import mark_day_ingested
+        from src.docs_engine import rebuild_doc_versions
+        from src.memory import process_feedback_for_day
+        from src.usage import UsageTracker
+
+        for day in range(1, 6):
+            ingest_day(day)
+
+        conn = get_connection(self.db_file)
+        try:
+            # 1. Manager assigns Cobaltline security on Day 6, then p03 submits feedback overriding it to Neha on Day 7
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, body, sanitized_body, has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_sec_mgr', 6, 1, 'org_kp', 'mail', '2026-11-07T08:00:00Z', '2026-11-07',
+                    'p03', 'cobaltline', 'team',
+                    'Dev Patel now owns Cobaltline security.',
+                    'Dev Patel now owns Cobaltline security.',
+                    0, 0, 0, 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO feedback(day, ingested_on_day, person, type, meeting, words)
+                VALUES (6, 7, 'p03', 'correction', 'ev-cl-ro-05', 'No, Neha Joshi handles Cobaltline security now, not Dev Patel.')
+                """
+            )
+            # 2. Doc v3 on d-nb-launch adds new field "Rollback window: 2 hours"
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, doc_id, version, title, body, sanitized_body,
+                    has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_nb_v3', 7, 1, 'org_kp', 'doc', '2026-11-08T05:00:00Z', '2026-11-08',
+                    'p07', 'northbeam', 'team', 'd-nb-launch', 3, 'Northbeam launch plan',
+                    'Northbeam launch plan.\nLaunch date: 14 Nov 2026.\nBilling contact: Kavya Nair (accounts).\nRollback window: 2 hours.',
+                    'Northbeam launch plan.\nLaunch date: 14 Nov 2026.\nBilling contact: Kavya Nair (accounts).\nRollback window: 2 hours.',
+                    0, 0, 0, 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, event_id, start_utc, attendees_json, title, body, sanitized_body,
+                    has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                ) VALUES (
+                    'r_ev_cl_8', 7, 2, 'org_kp', 'event', '2026-11-08T01:00:00Z', '2026-11-08',
+                    'p03', 'cobaltline', 'team', 'ev-cl-ro-08', '2026-11-09T10:30:00Z', '["p03"]',
+                    'Cobaltline call', 'Cobaltline call', 'Cobaltline call', 0, 0, 0, 0
+                ), (
+                    'r_ev_nb_8', 7, 3, 'org_kp', 'event', '2026-11-08T01:05:00Z', '2026-11-08',
+                    'p02', 'northbeam', 'team', 'ev-nb-me-08', '2026-11-09T05:30:00Z', '["p02"]',
+                    'Northbeam call', 'Northbeam call', 'Northbeam call', 0, 0, 0, 0
+                )
+                """
+            )
+            rebuild_doc_versions(conn)
+            rebuild_claims(conn)
+            process_feedback_for_day(conn, 7)
+            mark_day_ingested(conn, 7)
+            conn.commit()
+
+            # Non-billing correction works in BOTH ask and brief
+            sec_ans = answer_question(conn, "p03", "2026-11-08T18:00:00Z", "Who owns Cobaltline security?")
+            self.assertIn("Neha", sec_ans["answer"]["text"])
+            self.assertNotIn("Dev", sec_ans["answer"]["text"])
+
+            cl_by_id = {b["meeting_id"]: b for b in generate_briefs_for_person_date(conn, "p03", "2026-11-09")}
+            self.assertIn("ev-cl-ro-08", cl_by_id)
+            self.assertIn("Neha", " ".join(c["text"] for c in cl_by_id["ev-cl-ro-08"]["changed"]))
+
+            # Doc v3 new field appears in Northbeam brief
+            nb_by_id = {b["meeting_id"]: b for b in generate_briefs_for_person_date(conn, "p02", "2026-11-09")}
+            self.assertIn("ev-nb-me-08", nb_by_id)
+            self.assertIn("2 hours", " ".join(c["text"] for c in nb_by_id["ev-nb-me-08"]["changed"]))
+
+            # Hinglish query with unseen modifier "naya" + launch-revert query do NOT short-circuit wrongly
+            seen_prompts = []
+
+            def fake_post(url, headers, payload, timeout):
+                um = payload["messages"][1]["content"]
+                seen_prompts.append(um)
+                if "rollback" in um.lower() or "r_nb_v3" in um:
+                    body = json.dumps({"answer": "The fallback time limit (rollback window) is 2 hours [r_nb_v3].", "sources": ["r_nb_v3"]})
+                else:
+                    body = json.dumps({"answer": "Northbeam ke naya status: Product feed fix blocked [r0hwyx1z].", "sources": ["r0hwyx1z"]})
+                return {"choices": [{"message": {"content": body}}], "usage": {"prompt_tokens": 300, "completion_tokens": 25}}
+
+            old_key = os.environ.get("GROQ_API_KEY")
+            os.environ["GROQ_API_KEY"] = "test-groq-key"
+            try:
+                fake_llm = LLMClient(http_post=fake_post)
+                tr1 = UsageTracker()
+                out_hi = answer_question(
+                    conn,
+                    "p02",
+                    "2026-11-08T18:00:00Z",
+                    "Kya scene hai Northbeam ka? Koi naya blocker hai kya?",
+                    llm_client=fake_llm,
+                    tracker=tr1,
+                )
+                self.assertIn("r0hwyx1z", out_hi["answer"]["sources"])
+                self.assertGreater(tr1.input_tokens, 0)
+
+                tr2 = UsageTracker()
+                out_rb = answer_question(
+                    conn,
+                    "p02",
+                    "2026-11-08T18:00:00Z",
+                    "What is the fallback time limit if the Northbeam launch needs to revert?",
+                    llm_client=fake_llm,
+                    tracker=tr2,
+                )
+                self.assertIn("2 hours", out_rb["answer"]["text"])
+                self.assertIn("r_nb_v3", out_rb["answer"]["sources"])
+            finally:
+                if old_key is None:
+                    os.environ.pop("GROQ_API_KEY", None)
+                else:
+                    os.environ["GROQ_API_KEY"] = old_key
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

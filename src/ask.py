@@ -127,6 +127,9 @@ _TOPIC_SYNONYMS: dict[str, list[str]] = {
     "churn": ["churn", "leave", "leaving", "cancel"],
     "feedback": ["feedback", "opinion", "notes", "approvals", "slow"],
     "salary": ["salary", "compensation", "pay", "raise"],
+    "rollback": ["rollback", "fallback", "revert", "recovery", "restore"],
+    "fallback": ["fallback", "rollback", "revert", "backup", "failover", "recovery"],
+    "revert": ["revert", "rollback", "fallback", "restore"],
 }
 
 _STATUS_TEXT = {
@@ -908,9 +911,10 @@ def _search_and_synthesize_fallback(
         ):
             return None
         # Ensure any unknown explicit proper/project tokens not in corpus aren't silently bypassed
+        min_unmapped_len = 5 if (cid and _ANALYTICAL_INTENT_RE.search(ask_text)) else 4
         unmapped_q = [
             w for w in base_terms
-            if len(w) >= 4
+            if (len(w) >= min_unmapped_len or re.search(r"\b" + w.capitalize() + r"\b", ask_text))
             and w not in ANALYTICAL_META_WORDS
             and w not in _SAFE_WORKPLACE_UNMAPPED
         ]
@@ -1527,9 +1531,14 @@ def answer_question(
 
     # Step 5: Weekday / relative-due / tied-task clarification check
     low_q = ask_text.lower()
+    _launch_date_re = re.compile(
+        r"\b(?:when\s+(?:is|will|does)\b.*?\b(?:launch|go[\s-]?live|release)|"
+        r"(?:launch|go[\s-]?live|release)\s+(?:date|schedule|day|moved|pushed|delayed|shifted)|"
+        r"(?:date|schedule)\s+(?:of|for)\s+(?:the\s+)?(?:\w+\s+)?(?:launch|go[\s-]?live|release))\b"
+    )
     is_client_claim_q = (
         ("billing" in low_q and not any("billing" in t["title"].lower() for t in task_matches))
-        or ("launch" in low_q and not any("launch" in t["title"].lower() for t in task_matches))
+        or (bool(_launch_date_re.search(low_q)) and not any("launch" in t["title"].lower() for t in task_matches))
     )
     if not is_analytical and (
         not task_matches
@@ -1650,7 +1659,7 @@ def answer_question(
                 }
                 return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
 
-        if re.search(r"\b(?:launch|go[\s-]?live|release)\b", low_q) and re.search(r"\b(?:when|date|schedule|moved|pushed|is)\b", low_q):
+        if _launch_date_re.search(low_q):
             win = get_winning_claim(
                 conn, person_id, f"{cid}:launch_date", upto_day=current_day, upto_utc=at_utc, query_date=query_local_date
             )
@@ -1665,6 +1674,84 @@ def answer_question(
                     "usage": tracker.to_dict(),
                 }
                 return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
+
+        asks_owner = bool(
+            re.search(
+                r"\b(?:who\s+(?:owns|handles|leads|manages|runs|is\s+(?:in\s+charge|responsible|leading|handling|owning))|"
+                r"owner\s+of|lead\s+(?:for|of)|contact\s+for)\b",
+                low_q,
+            )
+        )
+        asks_date = bool(
+            re.search(
+                r"\b(?:when\s+is|what(?:'s|\s+is)\s+the\s+.*?\bdate\b|date\s+(?:for|of)|scheduled\s+for)\b",
+                low_q,
+            )
+        )
+        if (asks_owner or asks_date) and not task_matches:
+            allowed_preds = ("owner",) if asks_owner else ("date", "field_update")
+            subj_candidates = conn.execute(
+                """
+                SELECT DISTINCT subject_key, predicate
+                FROM claims
+                WHERE org = ? AND client = ? AND is_forgotten = 0 AND day <= ?
+                """,
+                (person_org, cid, current_day),
+            ).fetchall()
+            cli_skip = _client_ignore_tokens(conn, person_org, cid, client_res.get("phrase")) | {
+                "owner", "date", "lead", "contact", "for", "the", "of", "doc", "field",
+            }
+            best_sk: str | None = None
+            best_score = 0
+            best_tok_count = 0
+            for srow in subj_candidates:
+                pred = str(srow["predicate"])
+                if pred not in allowed_preds:
+                    continue
+                sk = str(srow["subject_key"])
+                raw_slug = sk.split(":", 1)[-1]
+                if raw_slug.startswith("doc_field:"):
+                    raw_slug = raw_slug.split(":", 1)[-1]
+                slug_toks = [
+                    tok for tok in re.split(r"[^a-z0-9]+", raw_slug.lower())
+                    if len(tok) >= 2 and tok not in cli_skip
+                ]
+                hits = sum(
+                    1 for tok in slug_toks
+                    if re.search(r"\b" + re.escape(tok) + r"\b", low_q)
+                )
+                if hits >= 1 and (hits > best_score or (hits == best_score and len(slug_toks) > best_tok_count)):
+                    best_score = hits
+                    best_tok_count = len(slug_toks)
+                    best_sk = sk
+
+            if best_sk:
+                win = get_winning_claim(
+                    conn, person_id, best_sk, upto_day=current_day, upto_utc=at_utc, query_date=query_local_date
+                )
+                if win:
+                    ans_srcs = _safe_matched_sources(
+                        conn, win.get("sources"), person_id, person_org, current_day, at_utc
+                    )
+                    topic_lbl = best_sk.split(":", 1)[-1]
+                    if topic_lbl.startswith("doc_field:"):
+                        topic_lbl = topic_lbl.split(":", 1)[-1]
+                    topic_lbl = re.sub(r"(?:_owner|_date)$", "", topic_lbl).replace("_", " ").strip() or "this area"
+                    if win["predicate"] == "owner":
+                        opid, oname = _format_owner_name(win["object_val"], people_map)
+                        if opid:
+                            base_matched.append({"phrase": oname, "id": opid, "sources": ans_srcs})
+                        ans_text = f"{oname} handles {topic_lbl} for {cname}."
+                    else:
+                        ans_text = f"The {cname} {topic_lbl} is {win['object_val']}."
+                    out = {
+                        "answer": {"text": ans_text, "sources": ans_srcs},
+                        "matched": base_matched,
+                        "clarify": None,
+                        "refused": None,
+                        "usage": tracker.to_dict(),
+                    }
+                    return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
 
     # Step 8: Open promises & commitments
     if not is_analytical and re.search(r"\b(?:promis(?:e|ed|es)|commit(?:ment|ted|ments)|owed|owe|deliverables?\s+pending)\b", low_q):

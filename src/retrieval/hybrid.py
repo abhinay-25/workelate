@@ -27,7 +27,13 @@ _HINGLISH_STOPWORDS = frozenset(
         "kaisa", "kaisi", "baat", "wala", "wali", "wale", "kar", "karo",
         "karna", "kiya", "diya", "diye", "dekhta", "dekhti", "sambhal",
         "sambhalta", "aaya", "aayi", "aaye", "mila", "mili", "mile", "bhi",
-        "baad", "pehle", "please", "pls",
+        "baad", "pehle", "please", "pls", "naya", "nayi", "naye", "purana",
+        "purani", "bada", "badi", "bade", "chota", "choti", "zaroori", "jaruri",
+        "khas", "khaas", "ab", "toh", "hi", "mat", "nahi", "nahin", "haan",
+        "han", "kaha", "lagta", "hota", "hoti", "hote", "rahega", "rahegi",
+        "hoga", "hogi", "honge", "dekh", "dikha", "dikhao", "batana", "bataye",
+        "chalna", "chalta", "chalti", "aajkal", "abtak", "bilkul", "thoda",
+        "zyada", "jyada", "bahut", "bohot", "bhai", "yaar",
     }
 )
 
@@ -69,7 +75,13 @@ ANALYTICAL_META_WORDS = frozenset(
         "something", "update", "updates", "status", "team", "teams", "client",
         "clients", "deliver", "delivery", "risk", "risks", "deadline", "deadlines",
         "right", "else", "still", "already", "actually", "really", "around",
-        "here", "well", "filhaal", "presently",
+        "here", "well", "filhaal", "presently", "new", "newest", "latest",
+        "fresh", "urgent", "critical", "important", "top", "big", "biggest",
+        "remaining", "open", "active", "existing", "known", "potential",
+        "possible", "likely", "upcoming", "future", "past", "prior", "previous",
+        "high", "low", "action", "actions", "step", "steps", "plan", "plans",
+        "concern", "concerns", "challenge", "challenges", "hurdle", "hurdles",
+        "obstacle", "obstacles", "warning", "warnings", "alert", "alerts",
     }
 )
 

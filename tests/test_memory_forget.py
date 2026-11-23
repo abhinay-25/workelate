@@ -173,6 +173,58 @@ class TestMemoryFeedbackAndForget(unittest.TestCase):
         self.assertEqual(len(open_after), 1)
         self.assertEqual(open_after[0]["sources"], ["r4u7rk4q"])
 
+    def test_deterministic_idiomatic_preferences_without_llm(self) -> None:
+        pack_copy = os.path.join(self.tmpdir.name, "pack_prefs")
+        shutil.copytree(os.path.join(NESTED_PACK, "data"), os.path.join(pack_copy, "data"))
+        with open(os.path.join(pack_copy, "data", "days", "day-06.jsonl"), "w", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "id": "rd6_pref_01",
+                        "org": "org_kp",
+                        "type": "chat",
+                        "at": "2026-11-07T06:00:00Z",
+                        "author": "p03",
+                        "client": "cobaltline",
+                        "visibility": "team",
+                        "body": "Morning standup.",
+                    }
+                )
+                + "\n"
+            )
+        with open(os.path.join(pack_copy, "data", "feedback", "day-05.jsonl"), "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "day": 5,
+                        "person": "p03",
+                        "type": "preference",
+                        "words": "Keep my briefs short, limit to 3 items, and put blocked items at the top please.",
+                    }
+                )
+                + "\n"
+            )
+        db6 = os.path.join(self.tmpdir.name, "mem_prefs.db")
+        saved = {
+            k: os.environ.pop(k, None)
+            for k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY")
+        }
+        try:
+            for d in range(1, 7):
+                ingest_day(d, pack_dir=pack_copy, db_file=db6)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+        c6 = get_connection(db6)
+        try:
+            prefs = get_person_preferences(c6, "p03", upto_day=6)
+            self.assertEqual(prefs["max_changed"], 3)
+            self.assertTrue(prefs["blockers_first"])
+        finally:
+            c6.close()
+
 
 if __name__ == "__main__":
     unittest.main()

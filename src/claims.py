@@ -472,7 +472,7 @@ def rebuild_claims(conn: sqlite3.Connection, llm_client: LLMClient | None = None
                     author=author,
                     readers_json=readers_json,
                 )
-            elif client and changed_here and old_val is not None and not fkey.startswith("cell_"):
+            elif client and changed_here and not fkey.startswith("cell_"):
                 _insert_claim(
                     conn,
                     org=org,
@@ -480,7 +480,7 @@ def rebuild_claims(conn: sqlite3.Connection, llm_client: LLMClient | None = None
                     subject_key=f"{client}:doc_field:{fkey}",
                     predicate="field_update",
                     object_val=val,
-                    old_val=str(old_val),
+                    old_val=str(old_val) if old_val is not None else None,
                     source_kind="doc_changed_field",
                     author_role=author_role,
                     effective_at_utc=eff_utc,
@@ -963,6 +963,29 @@ def get_winning_claim(
     # Also collect any prior superseded value and its source for "moved from X to Y" briefs
     prior_rows = [r for r in ranked if str(r["object_val"]) != win_val]
     old_val = winner["old_val"] or (str(prior_rows[0]["object_val"]) if prior_rows else None)
+
+    if not sources and str(winner["source_kind"]) == "feedback_correction":
+        sources = [str(r["source_record_id"]) for r in prior_rows if r["source_record_id"]][:1]
+        if not sources and winner["feedback_id"] is not None:
+            fb_row = conn.execute(
+                "SELECT meeting FROM feedback WHERE feedback_id = ?",
+                (winner["feedback_id"],),
+            ).fetchone()
+            if fb_row and fb_row["meeting"]:
+                day_lim = get_current_day(conn) if upto_day is None else upto_day
+                ev_sql = (
+                    "SELECT * FROM records WHERE event_id = ? AND org = ? "
+                    "AND is_forgotten = 0 AND day <= ?"
+                )
+                ev_args: list[Any] = [str(fb_row["meeting"]), str(winner["org"]), day_lim]
+                if upto_utc is not None:
+                    ev_sql += " AND at_utc <= ?"
+                    ev_args.append(upto_utc)
+                ev_sql += " ORDER BY at_utc DESC"
+                for ev_rec in conn.execute(ev_sql, ev_args).fetchall():
+                    if can_view(ev_rec, person_id, str(winner["org"])):
+                        sources = [str(ev_rec["id"])]
+                        break
 
     return {
         "subject_key": str(winner["subject_key"]),

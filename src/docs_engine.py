@@ -69,6 +69,8 @@ def extract_doc_kv(
                     kv[f"cell_{str(cell_k).lower()}"] = str(cell_v)
                 _, paired_kv = format_sheet_cells(cells)
                 kv.update(paired_kv)
+                if paired_kv:
+                    return kv, False
         except ValueError:
             pass
 

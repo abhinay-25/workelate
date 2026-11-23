@@ -30,7 +30,7 @@ EmbedFn = Callable[[list[str]], list[list[float]]]
 # Curated domain-agnostic workplace semantic concept clusters mapped onto latent concept axes [0..31].
 # Note: intentionally excludes dataset-specific client/person names.
 _CONCEPT_CLUSTERS: tuple[tuple[int, frozenset[str]], ...] = (
-    (0, frozenset({"backup", "failover", "contingency", "disaster", "recovery", "redundancy", "fallback", "restore", "arrangement"})),
+    (0, frozenset({"backup", "failover", "contingency", "disaster", "recovery", "redundancy", "fallback", "rollback", "revert", "undo", "restore", "arrangement"})),
     (1, frozenset({"upgrade", "upgraded", "runtime", "environment", "migration", "migrated", "patch", "version", "node", "infra", "infrastructure", "server", "deploy", "deployed"})),
     (2, frozenset({"staging", "sandbox", "uat", "qa", "testing", "test", "verification", "walkthrough"})),
     (3, frozenset({"billing", "invoice", "invoicing", "invoices", "rebate", "discount", "pricing", "rate", "fee", "charges", "payment", "accounts", "finance", "financial"})),
