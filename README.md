@@ -10,7 +10,40 @@ This repository includes a pre-configured `.env` file so the assistant works imm
 
 > **Note:** On first backend startup (or `ingest`), SQLite `.r3_assist.db` automatically seeds Days 1–5 from `BuildSprint-R3-candidate/`.
 
-### Option 1: Run the Full WorkMate Web UI (FastAPI + React/Vite)
+### Option 1: Primary Evaluation CLI (`assist.py` — Pure Python 3.12 Stdlib, Required)
+
+The core CLI (`assist.py`) is the **primary required evaluation entrypoint** and runs with **zero external pip packages** (Python 3.12 standard library only):
+
+```powershell
+# 1. Ingest workspace days incrementally (Day 1 resets/initializes schema; idempotent if repeated)
+python -B assist.py ingest --day 1
+python -B assist.py ingest --day 2
+python -B assist.py ingest --day 3
+python -B assist.py ingest --day 4
+python -B assist.py ingest --day 5
+
+# 2. Generate a delta-watermarked meeting brief for Meera Iyer (p02)
+python -B assist.py brief --person p02 --date 2026-11-05
+
+# 3. Ask a factual question (deterministic, $0 / 0 tokens)
+python -B assist.py ask --person p02 --at 2026-11-06T18:00:00Z --ask "Who handles billing for Northbeam?"
+
+# 4. Ask an open-ended analytical or Hinglish question (LLM-synthesized with grounded citations)
+python -B assist.py ask --person p02 --at 2026-11-06T18:00:00Z --ask "Write an executive memo summarizing current project risks and recommendations."
+python -B assist.py ask --person p02 --at 2026-11-06T18:00:00Z --ask "Kya scene hai Cobaltline ka? Kaam progress mein hai ya kuch major blocker chal raha hai?"
+
+# 5. Forget private memory (cascades across records, tasks, claims, promises, vectors, and brief cache)
+python -B assist.py forget --person p02 --what "my Dubai trip"
+
+# 6. Audit all authorized knowledge retained for a user
+python -B assist.py audit --person p02
+```
+
+---
+
+### Option 2: Optional WorkMate Web UI (FastAPI + React/Vite)
+
+The WorkMate Web UI is an **optional visual companion** built directly on top of the same `src/` memory and reasoning engine as `assist.py`.
 
 **Terminal 1 — Start the FastAPI Backend (`http://127.0.0.1:8000`)**
 
@@ -37,46 +70,15 @@ Open **`http://localhost:5173`** in your browser. Vite proxies `/api/*` directly
 
 ---
 
-### Option 2: Run the CLI Directly (`assist.py` — Pure Python 3.12 Stdlib)
-
-The core CLI (`assist.py`) requires **zero external pip packages** — Python 3.12 standard library is sufficient:
-
-```powershell
-# 1. Ingest workspace days incrementally (Day 1 resets/initializes schema; idempotent if repeated)
-python -B assist.py ingest --day 1
-python -B assist.py ingest --day 2
-python -B assist.py ingest --day 3
-python -B assist.py ingest --day 4
-python -B assist.py ingest --day 5
-
-# 2. Generate a delta-watermarked meeting brief for Meera Iyer (p02)
-python -B assist.py brief --person p02 --date 2026-11-06
-
-# 3. Ask a factual question (deterministic, $0 / 0 tokens)
-python -B assist.py ask --person p02 --at 2026-11-06T18:00:00Z --ask "Who handles billing for Northbeam?"
-
-# 4. Ask an open-ended analytical or Hinglish question (LLM-synthesized with grounded citations)
-python -B assist.py ask --person p02 --at 2026-11-06T18:00:00Z --ask "Write an executive memo summarizing current project risks and recommendations."
-python -B assist.py ask --person p02 --at 2026-11-06T18:00:00Z --ask "Kya scene hai Cobaltline ka? Kaam progress mein hai ya kuch major blocker chal raha hai?"
-
-# 5. Forget private memory (cascades across records, tasks, claims, promises, vectors, and brief cache)
-python -B assist.py forget --person p02 --what "my Dubai trip"
-
-# 6. Audit all authorized knowledge retained for a user
-python -B assist.py audit --person p02
-```
-
----
-
 ### Option 3: Run Official Evaluation Harness & Full Test Suite
 
 ```powershell
-# Full unit, integration, vector retrieval, security firewall, and FastAPI test suite (95 tests)
+# Full unit, integration, vector retrieval, security firewall, and FastAPI test suite (101 tests)
 $env:PYTHONDONTWRITEBYTECODE = "1"
 python -B -m unittest discover -s tests -v
 
 # Replay & score official Days 1–5 pack (from repo root)
-python -B BuildSprint-R3-candidate/tools/run_days.py --cmd "python assist.py" --days 1-5 --out runs/final
+python -B BuildSprint-R3-candidate/tools/run_days.py --cmd "python -B assist.py" --days 1-5 --out runs/final
 python -B BuildSprint-R3-candidate/tools/score.py --run runs/final --days 1-5
 
 # Frontend TypeScript + Vite production build check
@@ -87,9 +89,30 @@ npm run build
 > **Note for `run_days.py`:** `tools/run_days.py` defaults cleanly from `BuildSprint-R3-candidate/`:
 > ```powershell
 > cd BuildSprint-R3-candidate
-> python -B tools/run_days.py --cmd "python ../assist.py" --days 1-5 --out ../runs/final
+> python -B tools/run_days.py --cmd "python -B ../assist.py" --days 1-5 --out ../runs/final
 > python -B tools/score.py --run ../runs/final --days 1-5
 > ```
+
+---
+
+## WorkMate Web UI Preview (Optional Companion)
+
+Although CLI (`assist.py`) is the required evaluation interface, the optional **WorkMate** React + FastAPI dashboard visually demonstrates person-scoped ACL enforcement, delta-watermarked meeting briefs, deterministic vs. live Groq LLM Q&A, factual corrections, right-to-be-forgotten cascades, and token/cost telemetry:
+
+### 1. Overview Dashboard (Persona Context, Blockers, Scheduled Meetings & Commitments)
+![Overview Dashboard](assets/screenshots/01-overview.png)
+
+### 2. Pre-Meeting Intelligence Briefs (`Brief Ready`, Suggested Question & Cited Changes)
+![Pre-Meeting Intelligence Briefs](assets/screenshots/02-meeting-briefs.png)
+
+### 3. Ask Assistant (`Deterministic ($0)` Lookups + Live `groq / openai/gpt-oss-120b` Executive Memo)
+![Ask Assistant Deterministic and Live LLM](assets/screenshots/03-ask-assistant.png)
+
+### 4. Memory Management (Authoritative Claims, Factual Corrections & Right to Be Forgotten)
+![Memory Management](assets/screenshots/04-memory-management.png)
+
+### 5. System Usage, 3-Tier LLM Failover Chain & Cost Telemetry
+![System Usage and 3-Tier LLM Telemetry](assets/screenshots/05-system-usage.png)
 
 ---
 
@@ -121,14 +144,14 @@ Select **Day 5 (`2026-11-06`)** and **`Meera Iyer (p02)`** (unless noted) to ver
 - `Who owns billing for the Mumbai client?` → `"Arjun Mehta handles billing for Northbeam Retail."` (`rgg1ex2g`)
 - `When is the Northbeam launch date?` → `"The Northbeam Retail launch date is 14 Nov (2026-11-14)."` (`rwzvbzdv`)
 - `What's the status of product feed fix (Northbeam)?` → `"Product feed fix is blocked (waiting on client assets)."` (`r0hwyx1z`)
-- `Who owns the Cobalt uat test plan?` *(as `Rohan Kapoor (p03)`)* → `"Dev Patel (p05) owns UAT test plan."`
+- `Who owns the Cobalt uat test plan?` *(as `Rohan Kapoor (p03)`)* → `"Rahul Verma (p15) owns UAT test plan."`
 - `What open promises are pending for Northbeam?` → Unfulfilled Northbeam commitments with owners and due dates
 - `When is my Dubai trip?` *(as `p02` before forgetting)* → `"Booked my Dubai trip for 20–24 Nov."` (`rjuznjge`)
 - `What is our disaster recovery failover arrangement for Cobalt?` → Matches `backup plan` (`r2htb0w2`) via 256-d semantic vector retrieval (`0` LLM tokens)
 
 ### 2. Interactive Ambiguity Clarification (`0` Tokens)
 - `Is the Friday thing done?` → Prompts clarification chips for `t-me-01: Send invoice to Northbeam` and `t-me-02: Review campaign copy`
-- `Send the NB deck to Arjun. Which Arjun is that?` → Resolves/disambiguates `Arjun Mehta (p11)` vs `Arjun Rao (p14)`
+- `Send the NB deck to Arjun. Which Arjun is that?` → Resolves/disambiguates `Arjun Mehta (p11)` vs `Arjun Rao (p23)`
 
 ### 3. Privacy Refusal & Out-of-Scope Abstention (`0` Tokens)
 - `What did Meera say about me?` *(as `Rohan Kapoor (p03)`)* → Refuses (`private`), zero private record leakage
@@ -180,7 +203,7 @@ Below are the **3 hardest real failure modes** discovered while building and har
 
 - **One-Page Design Note**: See [DESIGN_NOTE.md](DESIGN_NOTE.md) for the complete architecture answers covering brief selection, memory persistence & ACL enforcement, truth/recency ordering, and hard safety refusals.
 - **Models & Failover Chain**:
-  - **Primary LLM**: Groq (`GROQ_API_KEY`, auto-failover across `llama-3.3-70b-versatile` / `openai/gpt-oss-120b` / `qwen/qwen3.8-27b` / `openai/gpt-oss-20b`)
+  - **Primary LLM**: Groq (`GROQ_API_KEY`, configured default `openai/gpt-oss-120b` in `.env`, auto-failover across `qwen/qwen3.8-27b` / `openai/gpt-oss-20b` / `llama-3.3-70b-versatile`)
   - **Secondary LLM**: Google Gemini (`gemini-2.5-flash-lite` via `GEMINI_API_KEY`)
   - **Final Evaluation Fallback**: OpenAI (`gpt-4o-mini` via `OPENAI_API_KEY`)
 - **Stack & Libraries**:
@@ -211,9 +234,10 @@ Below are the **3 hardest real failure modes** discovered while building and har
 ├── .env                       # Pre-configured runtime & LLM keys (portable relative defaults)
 ├── .env.example               # Template reference
 ├── requirements.txt           # FastAPI Web UI backend dependencies
+├── assets/screenshots/        # 5 WorkMate Web UI screenshots embedded in README
 ├── BuildSprint-R3-candidate/  # Official challenge pack (data, answers, tools/run_days.py, score.py)
 ├── src/                       # Core Python engine (ingest, claims, tasks, promises, ask, brief, memory, retrieval, security, llm, usage)
 ├── backend/api/               # Thin FastAPI adapter exposing src/ to Web UI
 ├── frontend/                  # React 18 + TypeScript + Vite + Tailwind CSS + Recharts UI ("WorkMate")
-└── tests/                     # 96 automated unit, integration, security, retrieval, and FastAPI tests
+└── tests/                     # 101 automated unit, integration, security, retrieval, and FastAPI tests
 ```
