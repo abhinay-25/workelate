@@ -198,6 +198,41 @@ class TestTasksAndPromisesPack(unittest.TestCase):
                 ]
                 self.assertEqual(len(open_d6), 1)
                 self.assertEqual(open_d7, [])
+
+                iso_conn.execute(
+                    """
+                    INSERT INTO records(
+                        id, day, line_no, org, type, at_utc, local_date, author, client,
+                        visibility, body, sanitized_body, has_injection_span, is_boilerplate, is_newsletter, is_forgotten
+                    ) VALUES (
+                        'r_p6_open_chk', 6, 2, 'org_kp', 'chat', '2026-11-07T06:00:00Z', '2026-11-07',
+                        'p07', 'northbeam', 'team',
+                        'I''ll send the compliance validation checklist by 13 Nov.',
+                        'I''ll send the compliance validation checklist by 13 Nov.',
+                        0, 0, 0, 0
+                    ),
+                    (
+                        'r_p7_wip_chk', 7, 2, 'org_kp', 'chat', '2026-11-08T09:00:00Z', '2026-11-08',
+                        'p07', 'northbeam', 'team',
+                        'Still working on the compliance validation checklist before sending it out.',
+                        'Still working on the compliance validation checklist before sending it out.',
+                        0, 0, 0, 0
+                    )
+                    """
+                )
+                rebuild_promises(iso_conn)
+                iso_conn.commit()
+                still_open = [
+                    p for p in get_open_promises(iso_conn, "p02", "northbeam", upto_day=7)
+                    if "compliance validation checklist" in p["what"].lower()
+                ]
+                self.assertEqual(len(still_open), 1)
+                self.assertEqual(still_open[0]["owner"], "p07")
+                row_chk = iso_conn.execute(
+                    "SELECT status, fulfilled_by_record_id FROM promises WHERE record_id = 'r_p6_open_chk'"
+                ).fetchone()
+                self.assertEqual(row_chk["status"], "open")
+                self.assertIsNone(row_chk["fulfilled_by_record_id"])
             finally:
                 iso_conn.close()
 

@@ -73,7 +73,7 @@ Open **`http://localhost:5173`** in your browser. Vite proxies `/api/*` directly
 ### Option 3: Run Official Evaluation Harness & Full Test Suite
 
 ```powershell
-# Full unit, integration, vector retrieval, security firewall, and FastAPI test suite (101 tests)
+# Full unit, integration, vector retrieval, security firewall, and FastAPI test suite (104 tests)
 $env:PYTHONDONTWRITEBYTECODE = "1"
 python -B -m unittest discover -s tests -v
 
@@ -239,5 +239,5 @@ Below are the **3 hardest real failure modes** discovered while building and har
 ├── src/                       # Core Python engine (ingest, claims, tasks, promises, ask, brief, memory, retrieval, security, llm, usage)
 ├── backend/api/               # Thin FastAPI adapter exposing src/ to Web UI
 ├── frontend/                  # React 18 + TypeScript + Vite + Tailwind CSS + Recharts UI ("WorkMate")
-└── tests/                     # 101 automated unit, integration, security, retrieval, and FastAPI tests
+└── tests/                     # 104 automated unit, integration, security, retrieval, and FastAPI tests
 ```

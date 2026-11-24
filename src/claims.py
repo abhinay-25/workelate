@@ -30,15 +30,17 @@ _OWNS_DECL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Launch date change: "move the launch to 14 Nov" / "launch moves to 14 Nov"
-_LAUNCH_MOVE_RE = re.compile(
-    r"\b(?:move(?:d|s)?\s+(?:the\s+)?launch(?:\s+date)?\s+to|launch(?:\s+date)?\s+(?:moves|moved|is)\s+(?:to|on))\s+"
-    r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+(?:\s+\d{4})?|[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+\d{4})?)",
+_CORR_PREFIX_RE = re.compile(
+    r"^(?:(?:no|actually|correction|update|fyi|handover(?:\s+update)?|effective\s+today|"
+    r"starting\s+today|from\s+today|from\s+this\s+week)\s*[,:\-]?\s*)+",
     re.IGNORECASE,
 )
 
-_CORR_PREFIX_RE = re.compile(
-    r"^(?:(?:no|actually|correction|update|fyi)\s*[,:\-]\s*)+",
+# Launch date change: "move the launch to 14 Nov" / "go-live moved to 29 Mar 2027"
+_LAUNCH_MOVE_RE = re.compile(
+    r"\b(?:move(?:d|s)?\s+(?:the\s+)?(?:launch|go[\s-]?live|release)(?:\s+date)?\s+to|"
+    r"(?:launch|go[\s-]?live|release)(?:\s+date)?\s+(?:moves|moved|shifts|shifted|is)\s+(?:to|on))\s+"
+    r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+(?:\s+\d{4})?|[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+\d{4})?)",
     re.IGNORECASE,
 )
 
@@ -72,8 +74,14 @@ _SWITCHED_OWNER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MOVED_FROM_TO_RE = re.compile(
+    r"^(?:the\s+)?(.+?)\s+(?:moves|moved|shifts|shifted|transitions|transitioned|transfers|transferred|goes|went)\s+"
+    r"from\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+to\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)(?:[.!;]|$)",
+    re.IGNORECASE,
+)
+
 _DATE_CORR_RE = re.compile(
-    r"^(?:the\s+)?(?:([A-Za-z0-9 _-]+?)\s+)?(?:launch\s+date|launch)\s+"
+    r"^(?:the\s+)?(?:([A-Za-z0-9 _-]+?)\s+)?(?:launch\s+date|launch|go[\s-]?live(?:\s+date)?|release(?:\s+date)?)\s+"
     r"(?:is\s+(?:now\s+)?|moved\s+to\s+|pushed\s+to\s+|updated\s+to\s+|on\s+)"
     r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+(?:\s+\d{4})?|[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*,?\s*\d{4})?)"
     r"(?:\s*[,;(]?\s*(?:not|instead\s+of|rather\s+than|was|from)\s+"
@@ -92,13 +100,13 @@ _STRONG_CORRECTION_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Leave interval: "I'm on leave from 9 Nov till the 12th." or "Jordan is on leave till the 12th."
+# Leave interval: "I'm on leave from 9 Nov till the 12th." or "on leave from 10 Mar to 12 Mar 2027, back on 13 Mar."
 _LEAVE_RANGE_RE = re.compile(
-    r"\b(?:on\s+leave|ooo|out\s+of\s+office)\b.*?\bfrom\s+(.+?)\s+(?:till|until|to|-|–)\s+(.+?)(?=[.!?\n]|$)",
+    r"\b(?:on\s+leave|ooo|out\s+of\s+office)\b.*?(?:\bfrom\s+)?(.+?)\s+(?:till|until|to|-|–)\s+(.+?)(?=[,;.!?\n]|$)",
     re.IGNORECASE,
 )
 _LEAVE_UNTIL_RE = re.compile(
-    r"\b(?:on\s+leave|ooo|out\s+of\s+office)\b.*?\b(?:till|until|through)\s+(.+?)(?=[.!?\n]|$)",
+    r"\b(?:on\s+leave|ooo|out\s+of\s+office)\b.*?\b(?:till|until|through)\s+(.+?)(?=[,;.!?\n]|$)",
     re.IGNORECASE,
 )
 
@@ -252,17 +260,21 @@ def extract_correction_from_clause(
         if m_sw:
             topic_raw, old_name, new_name = m_sw.group(1).strip(), m_sw.group(2).strip(), m_sw.group(3).strip()
         else:
-            m_pas = _PASSIVE_CORR_RE.search(stripped)
-            if m_pas:
-                topic_raw = m_pas.group(1).strip()
-                new_name = m_pas.group(2).strip()
-                old_name = m_pas.group(3).strip() if m_pas.group(3) else None
+            m_mv = _MOVED_FROM_TO_RE.search(stripped)
+            if m_mv:
+                topic_raw, old_name, new_name = m_mv.group(1).strip(), m_mv.group(2).strip(), m_mv.group(3).strip()
             else:
-                m_act = _ACTIVE_CORR_RE.search(stripped)
-                if m_act:
-                    new_name = m_act.group(1).strip()
-                    topic_raw = m_act.group(2).strip()
-                    old_name = m_act.group(3).strip() if m_act.group(3) else None
+                m_pas = _PASSIVE_CORR_RE.search(stripped)
+                if m_pas:
+                    topic_raw = m_pas.group(1).strip()
+                    new_name = m_pas.group(2).strip()
+                    old_name = m_pas.group(3).strip() if m_pas.group(3) else None
+                else:
+                    m_act = _ACTIVE_CORR_RE.search(stripped)
+                    if m_act:
+                        new_name = m_act.group(1).strip()
+                        topic_raw = m_act.group(2).strip()
+                        old_name = m_act.group(3).strip() if m_act.group(3) else None
 
     if not new_name or not topic_raw:
         return None
@@ -428,7 +440,14 @@ def rebuild_claims(conn: sqlite3.Connection, llm_client: LLMClient | None = None
             source_kind = "doc_changed_field" if changed_here else "doc_carryover_field"
             old_val = fdata.get("old_val")
 
-            if client and fkey == "launch_date":
+            if client and fkey in (
+                "launch_date",
+                "go_live_date",
+                "golive_date",
+                "release_date",
+                "target_launch_date",
+                "target_go_live_date",
+            ):
                 local_dt = utc_to_local_dt(at_utc, people_map[author]["zone"] if author in people_map else None)
                 iso_date = parse_explicit_date(val, local_dt.year, local_dt.month) or val
                 _insert_claim(
@@ -450,7 +469,7 @@ def rebuild_claims(conn: sqlite3.Connection, llm_client: LLMClient | None = None
                     author=author,
                     readers_json=readers_json,
                 )
-            elif client and fkey in ("billing_contact", "billing_owner"):
+            elif client and fkey in ("billing_contact", "billing_owner", "billing_lead", "invoicing_contact"):
                 pid, full_name = _resolve_person_in_org(conn, org, val, client, "", val)
                 obj = f"{pid}:{full_name}" if pid else _strip_parenthetical(val)
                 _insert_claim(
@@ -482,6 +501,26 @@ def rebuild_claims(conn: sqlite3.Connection, llm_client: LLMClient | None = None
                     object_val=val,
                     old_val=str(old_val) if old_val is not None else None,
                     source_kind="doc_changed_field",
+                    author_role=author_role,
+                    effective_at_utc=eff_utc,
+                    at_utc=at_utc,
+                    day=day,
+                    source_record_id=rid,
+                    feedback_id=None,
+                    visibility=vis,
+                    author=author,
+                    readers_json=readers_json,
+                )
+            elif client and not fkey.startswith("cell_") and not fkey.startswith("_"):
+                _insert_claim(
+                    conn,
+                    org=org,
+                    client=client,
+                    subject_key=f"{client}:doc_field:{fkey}",
+                    predicate="doc_field",
+                    object_val=val,
+                    old_val=str(old_val) if old_val is not None else None,
+                    source_kind=source_kind,
                     author_role=author_role,
                     effective_at_utc=eff_utc,
                     at_utc=at_utc,
@@ -683,83 +722,108 @@ def rebuild_claims(conn: sqlite3.Connection, llm_client: LLMClient | None = None
                             readers_json=readers_json,
                         )
 
-                # Selective LLM fallback for idiomatic natural-language corrections in records
+                # Selective cached LLM fallback for strong idiomatic corrections in records
                 if (
                     not matched_clause
                     and not is_intern_role(author_role)
                     and _STRONG_CORRECTION_CUE_RE.search(clause)
                 ):
-                    llm = llm_client or LLMClient()
-                    if llm.configured_providers():
-                        tracker = UsageTracker()
-                        parsed = llm.call_json(
-                            "Extract a verified workplace correction into JSON. Set is_hedged_or_unverified=true if uncertain/rumor/question: "
-                            '{"is_correction": bool, "is_hedged_or_unverified": bool, "client": str|null, '
-                            '"subject_topic": str, "predicate": "owner"|"date"|"decision", "new_val": str, "old_val": str|null}',
-                            f"<workplace_record id=\"{rid}\" client=\"{client or ''}\">\n{clause}\n</workplace_record>",
-                            tracker,
-                            max_input_tokens=ASK_TOKEN_LIMIT,
-                        )
-                        if (
-                            isinstance(parsed, dict)
-                            and parsed.get("is_correction") is True
-                            and not parsed.get("is_hedged_or_unverified")
-                            and str(parsed.get("new_val") or "").strip()
-                        ):
-                            raw_new = str(parsed["new_val"]).strip()
-                            raw_old = str(parsed.get("old_val") or "").strip() or None
-                            new_toks = [t for t in re.findall(r"[a-z0-9]{2,}", raw_new.lower())]
-                            if new_toks and any(t in clause.lower() for t in new_toks):
-                                cid, pred_topic, _ = _normalize_client_and_topic(
-                                    conn,
-                                    org,
-                                    client or parsed.get("client"),
-                                    str(parsed.get("subject_topic") or "ownership"),
-                                )
-                                pred = str(parsed.get("predicate") or "owner")
-                                obj_val = raw_new
-                                old_val = raw_old
-                                if pred == "owner":
-                                    npid, nfull = _resolve_person_in_org(conn, org, raw_new, cid, channel, clause)
-                                    obj_val = f"{npid}:{nfull}" if npid else nfull
-                                    if raw_old:
-                                        opid, ofull = _resolve_person_in_org(conn, org, raw_old, cid, channel, clause)
-                                        old_val = f"{opid}:{ofull}" if opid else ofull
-                                elif pred == "date":
-                                    iso_n = parse_explicit_date(raw_new, local_dt.year, local_dt.month)
-                                    if iso_n:
-                                        obj_val = iso_n
-                                    if raw_old:
-                                        iso_o = parse_explicit_date(raw_old, local_dt.year, local_dt.month)
-                                        if iso_o:
-                                            old_val = iso_o
-                                subj = f"{cid}:{pred_topic}" if cid else pred_topic
-                                _insert_claim(
-                                    conn,
-                                    org=org,
-                                    client=cid,
-                                    subject_key=subj,
-                                    predicate=pred,
-                                    object_val=obj_val,
-                                    old_val=old_val,
-                                    source_kind="record_assertion",
-                                    author_role=author_role,
-                                    effective_at_utc=at_utc,
-                                    at_utc=at_utc,
-                                    day=day,
-                                    source_record_id=rid,
-                                    feedback_id=None,
-                                    visibility=vis,
-                                    author=author,
-                                    readers_json=readers_json,
-                                )
+                    import hashlib
+                    clause_sig = hashlib.blake2b(clause.encode("utf-8"), digest_size=6).hexdigest()
+                    cache_key = f"{rid}:{clause_sig}"
+                    cached_row = conn.execute(
+                        "SELECT parsed_json FROM llm_claim_cache WHERE record_id = ?",
+                        (cache_key,),
+                    ).fetchone()
+                    parsed: dict[str, Any] | None = None
+                    if cached_row is not None:
+                        try:
+                            loaded = json.loads(str(cached_row["parsed_json"]))
+                            if isinstance(loaded, dict):
+                                parsed = loaded
+                        except ValueError:
+                            parsed = None
+                    else:
+                        llm = llm_client or LLMClient()
+                        if llm.configured_providers():
+                            tracker = UsageTracker()
+                            res = llm.call_json(
+                                "Extract a verified workplace correction or handover into JSON. "
+                                "Set is_hedged_or_unverified=true if uncertain/rumor/question: "
+                                '{"is_correction": bool, "is_hedged_or_unverified": bool, "client": str|null, '
+                                '"subject_topic": str, "predicate": "owner"|"date"|"decision", "new_val": str, "old_val": str|null}',
+                                f"<workplace_record id=\"{rid}\" client=\"{client or ''}\">\n{clause}\n</workplace_record>",
+                                tracker,
+                                max_input_tokens=ASK_TOKEN_LIMIT,
+                            )
+                            parsed = res if isinstance(res, dict) else {}
+                            conn.execute(
+                                "INSERT OR REPLACE INTO llm_claim_cache(record_id, parsed_json) VALUES (?, ?)",
+                                (cache_key, json.dumps(parsed, ensure_ascii=False)),
+                            )
+                    if (
+                        isinstance(parsed, dict)
+                        and parsed.get("is_correction") is True
+                        and not parsed.get("is_hedged_or_unverified")
+                        and str(parsed.get("new_val") or "").strip()
+                    ):
+                        raw_new = str(parsed["new_val"]).strip()
+                        raw_old = str(parsed.get("old_val") or "").strip() or None
+                        new_toks = [t for t in re.findall(r"[a-z0-9]{2,}", raw_new.lower())]
+                        if new_toks and any(t in clause.lower() for t in new_toks):
+                            cid, pred_topic, _ = _normalize_client_and_topic(
+                                conn,
+                                org,
+                                client or parsed.get("client"),
+                                str(parsed.get("subject_topic") or "ownership"),
+                            )
+                            pred = str(parsed.get("predicate") or "owner")
+                            obj_val = raw_new
+                            old_val = raw_old
+                            if pred == "owner":
+                                npid, nfull = _resolve_person_in_org(conn, org, raw_new, cid, channel, clause)
+                                obj_val = f"{npid}:{nfull}" if npid else nfull
+                                if raw_old:
+                                    opid, ofull = _resolve_person_in_org(conn, org, raw_old, cid, channel, clause)
+                                    old_val = f"{opid}:{ofull}" if opid else ofull
+                            elif pred == "date":
+                                iso_n = parse_explicit_date(raw_new, local_dt.year, local_dt.month)
+                                if iso_n:
+                                    obj_val = iso_n
+                                if raw_old:
+                                    iso_o = parse_explicit_date(raw_old, local_dt.year, local_dt.month)
+                                    if iso_o:
+                                        old_val = iso_o
+                            subj = f"{cid}:{pred_topic}" if cid else pred_topic
+                            _insert_claim(
+                                conn,
+                                org=org,
+                                client=cid,
+                                subject_key=subj,
+                                predicate=pred,
+                                object_val=obj_val,
+                                old_val=old_val,
+                                source_kind="record_assertion",
+                                author_role=author_role,
+                                effective_at_utc=at_utc,
+                                at_utc=at_utc,
+                                day=day,
+                                source_record_id=rid,
+                                feedback_id=None,
+                                visibility=vis,
+                                author=author,
+                                readers_json=readers_json,
+                            )
 
         # Leave / OOO intervals
         m_leave = _LEAVE_RANGE_RE.search(body)
         if m_leave and author in people_map:
-            v_from = parse_explicit_date(m_leave.group(1), local_dt.year, local_dt.month)
-            ref_m = int(v_from[5:7]) if v_from else local_dt.month
-            v_until = parse_explicit_date(m_leave.group(2), local_dt.year, ref_m)
+            v_until = parse_explicit_date(m_leave.group(2), local_dt.year, local_dt.month)
+            ref_y = int(v_until[:4]) if v_until else local_dt.year
+            ref_m = int(v_until[5:7]) if v_until else local_dt.month
+            v_from = parse_explicit_date(m_leave.group(1), ref_y, ref_m)
+            if v_from and not v_until:
+                v_until = parse_explicit_date(m_leave.group(2), int(v_from[:4]), int(v_from[5:7]))
             if v_from and v_until:
                 _insert_claim(
                     conn,

@@ -45,9 +45,40 @@ _OWNERSHIP_CORR_RE = re.compile(
 )
 
 
-def _day_start_utc(day_num: int) -> str:
-    """Day 1 = 2026-11-02; return canonical start UTC for feedback ingested on day_num."""
-    dt = date(2026, 11, 1) + timedelta(days=max(1, day_num))
+def _day_start_utc(day_num: int, conn: sqlite3.Connection | None = None) -> str:
+    """Resolve canonical UTC start timestamp for ingested_on_day from dataset records."""
+    d_num = max(1, int(day_num))
+    if conn is not None:
+        exact = conn.execute(
+            """
+            SELECT SUBSTR(at_utc, 1, 10) AS d
+            FROM records
+            WHERE day = ? AND at_utc != ''
+            GROUP BY d
+            ORDER BY COUNT(*) DESC, d ASC
+            LIMIT 1
+            """,
+            (d_num,),
+        ).fetchone()
+        if exact and exact[0]:
+            return f"{exact[0]}T00:00:00Z"
+        anchor = conn.execute(
+            """
+            SELECT SUBSTR(at_utc, 1, 10) AS d
+            FROM records
+            WHERE day = 1 AND at_utc != ''
+            GROUP BY d
+            ORDER BY COUNT(*) DESC, d ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if anchor and anchor[0]:
+            try:
+                dt = date.fromisoformat(str(anchor[0])) + timedelta(days=d_num - 1)
+                return f"{dt.isoformat()}T00:00:00Z"
+            except ValueError:
+                pass
+    dt = date(2026, 11, 1) + timedelta(days=d_num)
     return f"{dt.isoformat()}T00:00:00Z"
 
 
@@ -195,6 +226,10 @@ def _process_correction(
         return
     client_id = _infer_meeting_client(conn, meeting_id, org, words)
 
+    day_start = _day_start_utc(ingested_day, conn=conn)
+    loc_year = int(day_start[:4])
+    loc_month = int(day_start[5:7])
+
     # Try shared deterministic natural-language extractor first (handles active, passive, switched, date)
     corr = extract_correction_from_clause(
         conn,
@@ -202,8 +237,8 @@ def _process_correction(
         client_id,
         "",
         words,
-        local_year=2026,
-        local_month=11,
+        local_year=loc_year,
+        local_month=loc_month,
         allow_unresolved_names=True,
     )
     if corr is not None:
@@ -225,8 +260,8 @@ def _process_correction(
                 corr["predicate"],
                 corr["object_val"],
                 corr["old_val"],
-                _day_start_utc(ingested_day),
-                _day_start_utc(ingested_day),
+                day_start,
+                day_start,
                 ingested_day,
                 support_id,
                 fb_id,
@@ -286,8 +321,8 @@ def _process_correction(
                 subj,
                 obj_val,
                 old_val,
-                _day_start_utc(ingested_day),
-                _day_start_utc(ingested_day),
+                day_start,
+                day_start,
                 ingested_day,
                 support_id,
                 fb_id,
@@ -329,9 +364,9 @@ def _process_correction(
                     opid, ofull = _resolve_person_in_org(conn, org, raw_old, cid, "", words)
                     old_val = f"{opid}:{ofull}" if opid else ofull
             elif pred == "date":
-                obj_val = parse_explicit_date(raw_new, 2026, 11) or raw_new
+                obj_val = parse_explicit_date(raw_new, loc_year, loc_month) or raw_new
                 if raw_old:
-                    old_val = parse_explicit_date(raw_old, 2026, 11) or raw_old
+                    old_val = parse_explicit_date(raw_old, loc_year, loc_month) or raw_old
             subj = f"{cid}:{pred_topic}" if cid else pred_topic
             support_id = _find_supporting_team_record(
                 conn, org, cid, [raw_new.split()[0], topic_clean], ingested_day
@@ -351,8 +386,8 @@ def _process_correction(
                     pred,
                     obj_val,
                     old_val,
-                    _day_start_utc(ingested_day),
-                    _day_start_utc(ingested_day),
+                    day_start,
+                    day_start,
                     ingested_day,
                     support_id,
                     fb_id,

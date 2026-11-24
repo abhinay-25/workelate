@@ -109,11 +109,11 @@ def rebuild_doc_versions(conn: sqlite3.Connection) -> None:
           AND type IN ('doc', 'sheet')
           AND COALESCE(doc_id, sheet_id) IS NOT NULL
           AND (has_injection_span = 0 OR TRIM(COALESCE(sanitized_body, '')) != '')
-        ORDER BY COALESCE(doc_id, sheet_id) ASC, COALESCE(version, 1) ASC, at_utc ASC
+        ORDER BY org ASC, COALESCE(doc_id, sheet_id) ASC, COALESCE(version, 1) ASC, at_utc ASC
         """
     ).fetchall()
 
-    prev_by_doc: dict[str, tuple[str, dict[str, dict[str, Any]]]] = {}
+    prev_by_doc: dict[tuple[str, str], tuple[str, dict[str, dict[str, Any]]]] = {}
 
     for rec in rows:
         doc_id = str(rec["doc_id"] or rec["sheet_id"])
@@ -128,7 +128,7 @@ def rebuild_doc_versions(conn: sqlite3.Connection) -> None:
         title = rec["title"] or rec["subject"] or doc_id
 
         raw_kv, is_no_change = extract_doc_kv(title, str(rec["sanitized_body"] or ""), rec["cells_json"])
-        prev_rid, prev_fields = prev_by_doc.get(doc_id, (None, {}))
+        prev_rid, prev_fields = prev_by_doc.get((org, doc_id), (None, {}))
 
         structured_fields: dict[str, dict[str, Any]] = {}
         diffs: list[dict[str, Any]] = []
@@ -180,7 +180,7 @@ def rebuild_doc_versions(conn: sqlite3.Connection) -> None:
 
         conn.execute(
             """
-            INSERT INTO doc_versions(
+            INSERT OR REPLACE INTO doc_versions(
                 doc_id, kind, version, record_id, day, at_utc, org, client, author, title,
                 extracted_kv_json, diff_summary_json, is_forgotten
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -200,4 +200,4 @@ def rebuild_doc_versions(conn: sqlite3.Connection) -> None:
                 json.dumps(diffs, ensure_ascii=False),
             ),
         )
-        prev_by_doc[doc_id] = (rid, structured_fields)
+        prev_by_doc[(org, doc_id)] = (rid, structured_fields)

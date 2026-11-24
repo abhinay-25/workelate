@@ -346,6 +346,19 @@ def resolve_task_mentions(
         params,
     ).fetchall()
 
+    client_name_tokens: set[str] = set()
+    for crow in conn.execute("SELECT client_id, name FROM clients WHERE org_id = ?", (org,)).fetchall():
+        client_name_tokens.add(str(crow["client_id"]).lower())
+        for tok in re.findall(r"[a-z0-9]{2,}", str(crow["name"] or "").lower()):
+            client_name_tokens.add(tok)
+    for arow in conn.execute(
+        "SELECT alias FROM entity_aliases WHERE org_id = ? AND entity_type = 'client'",
+        (org,),
+    ).fetchall():
+        for tok in re.findall(r"[a-z0-9]{2,}", str(arow["alias"] or "").lower()):
+            if len(tok) >= 3:
+                client_name_tokens.add(tok)
+
     clean_q = _strip_distractors(text).lower()
     q_tokens = set(re.findall(r"[a-z0-9]{2,}", clean_q))
     matches: list[dict[str, Any]] = []
@@ -359,15 +372,22 @@ def resolve_task_mentions(
             continue
 
         score = 0.0
+        strength = "multi"
         if t_low in clean_q:
             score = 10.0
+            strength = "exact"
         else:
             overlap = sum(1 for tok in t_tokens if tok in q_tokens)
+            non_client_overlap = sum(
+                1 for tok in t_tokens if tok in q_tokens and tok not in client_name_tokens
+            )
             ratio = overlap / len(t_tokens)
-            if ratio >= 0.65 and overlap >= 2:
+            if non_client_overlap >= 1 and ratio >= 0.65 and overlap >= 2:
                 score = 5.0 * ratio
-            elif len(t_tokens) == 1 and t_tokens[0] in q_tokens:
+                strength = "multi"
+            elif len(t_tokens) == 1 and t_tokens[0] in q_tokens and t_tokens[0] not in client_name_tokens:
                 score = 4.0
+                strength = "single"
 
         if score > 0:
             if client_hint and row["client"] == client_hint:
@@ -381,6 +401,7 @@ def resolve_task_mentions(
                         "title": title,
                         "client": row["client"],
                         "score": score,
+                        "match_strength": strength,
                         "source_record_id": row["first_rec_id"],
                     }
                 )
@@ -403,7 +424,14 @@ def resolve_task_mentions(
             tid = str(row["task_id"])
             title = str(row["title"] or "")
             t_tokens = [t for t in re.findall(r"[a-z0-9]{2,}", title.lower()) if t not in {"the", "for", "and", "to"}]
-            shared = [tok for tok in t_tokens if len(tok) >= 4 and tok not in _GENERIC_TASK_WORDS and tok in q_tokens]
+            shared = [
+                tok
+                for tok in t_tokens
+                if len(tok) >= 4
+                and tok not in _GENERIC_TASK_WORDS
+                and tok not in client_name_tokens
+                and tok in q_tokens
+            ]
             if len(shared) == 1:
                 score = 2.5
                 if client_hint and row["client"] == client_hint:
@@ -417,6 +445,7 @@ def resolve_task_mentions(
                             "title": title,
                             "client": row["client"],
                             "score": score,
+                            "match_strength": "single",
                             "source_record_id": row["first_rec_id"],
                         }
                     )
@@ -650,6 +679,7 @@ def resolve_person_mention(
                 SELECT ce.weight, ce.source_record_id FROM collab_edges ce
                 JOIN records r ON r.id = ce.source_record_id
                 WHERE ce.org_id = :org AND ce.person_a = :asker AND ce.person_b = :cand
+                  AND r.is_boilerplate = 0 AND r.is_newsletter = 0
                   AND {where}
                 """,
                 {"org": org, "asker": asker_id, "cand": pid, **params},
@@ -666,6 +696,7 @@ def resolve_person_mention(
                     SELECT ce.weight, ce.source_record_id FROM collab_edges ce
                     JOIN records r ON r.id = ce.source_record_id
                     WHERE ce.org_id = :org AND ce.person_a = :cand AND ce.client = :cid
+                      AND r.is_boilerplate = 0 AND r.is_newsletter = 0
                       AND {where}
                     """,
                     {"org": org, "cand": pid, "cid": client_id, **params},

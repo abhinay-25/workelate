@@ -1,7 +1,7 @@
 """Modular vector and hybrid (FTS5 + dense vector) semantic retrieval subsystem."""
 
 from src.retrieval.embedder import EmbeddingClient, LocalSemanticEmbedder
-from src.retrieval.hybrid import search_fts5, search_hybrid
+from src.retrieval.hybrid import search_fts5, search_hybrid, superseded_doc_sheet_ids
 from src.retrieval.vector_store import (
     QdrantLocalVectorStore,
     SQLiteVectorStore,
@@ -26,4 +26,5 @@ __all__ = [
     "search_fts5",
     "search_semantic",
     "search_hybrid",
+    "superseded_doc_sheet_ids",
 ]

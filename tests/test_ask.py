@@ -834,6 +834,95 @@ class AskEngineTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_capitalized_leave_filler_doc_boilerplate_and_per_term_privacy(self) -> None:
+        from src.claims import rebuild_claims
+        from src.db import mark_day_ingested, reset_db
+        from src.entities import extract_entities_for_day, resolve_person_mention
+        from src.filters import classify_noise
+
+        filler_body = "Working notes for kestrel_t.\n" + " ".join(
+            ["Weekly capacity metrics look steady compared with the prior sprint baseline."] * 10
+        )
+        rec_meta = {"type": "doc", "author": "p_l2", "client": "cl_k", "title": "Working notes #1"}
+        is_bp, _ = classify_noise(rec_meta, filler_body)
+        self.assertEqual(is_bp, 1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = os.path.join(tmpdir, "ask_reg.db")
+            reset_db(db_file)
+            conn = get_connection(db_file)
+            try:
+                conn.execute("INSERT INTO orgs(org_id, name) VALUES ('org_vx', 'Velox Test')")
+                conn.execute(
+                    "INSERT INTO people(person_id, org_id, name, first_name, last_name, role, team, zone) VALUES "
+                    "('p_ask', 'org_vx', 'Tariq Test', 'Tariq', 'Test', 'manager', 'client', 'Asia/Dubai'), "
+                    "('p_col', 'org_vx', 'Priya Test', 'Priya', 'Test', 'engineer', 'dev', 'Asia/Kolkata'), "
+                    "('p_l1', 'org_vx', 'Lucas One', 'Lucas', 'One', 'developer', 'dev', 'UTC'), "
+                    "('p_l2', 'org_vx', 'Lucas Two', 'Lucas', 'Two', 'security engineer', 'dev', 'UTC')"
+                )
+                conn.execute("INSERT INTO clients(client_id, org_id, name) VALUES ('cl_k', 'org_vx', 'Kestrel Test')")
+                conn.execute(
+                    """
+                    INSERT INTO records(
+                        id, day, line_no, org, type, at_utc, local_date, author, client, visibility,
+                        doc_id, version, title, body, sanitized_body, has_injection_span, is_boilerplate, is_newsletter
+                    ) VALUES
+                    ('r_leave_1', 2, 1, 'org_vx', 'chat', '2027-03-09T04:00:00Z', '2027-03-09', 'p_col', NULL, 'team',
+                     NULL, NULL, NULL, 'Heads up: I will be on leave from 10 Mar to 12 Mar 2027, back on 13 Mar.',
+                     'Heads up: I will be on leave from 10 Mar to 12 Mar 2027, back on 13 Mar.', 0, 0, 0),
+                    ('r_priv_1', 2, 2, 'org_vx', 'chat', '2027-03-09T05:00:00Z', '2027-03-09', 'p_l1', NULL, 'private',
+                     NULL, NULL, NULL, 'Booked my Lisbon dental surgery for 19-21 Mar.',
+                     'Booked my Lisbon dental surgery for 19-21 Mar.', 0, 0, 0),
+                    ('r_doc_bp', 2, 3, 'org_vx', 'doc', '2027-03-09T06:00:00Z', '2027-03-09', 'p_l2', 'cl_k', 'team',
+                     'd_bp', 1, 'Working notes #1', ?, ?, 0, ?, 0),
+                    ('r_real_k', 2, 4, 'org_vx', 'chat', '2027-03-09T07:00:00Z', '2027-03-09', 'p_l2', 'cl_k', 'team',
+                     NULL, NULL, NULL, 'Lucas Two is leading Kestrel Test security slides.',
+                     'Lucas Two is leading Kestrel Test security slides.', 0, 0, 0),
+                    ('r_bill_k', 2, 5, 'org_vx', 'mail', '2027-03-09T08:00:00Z', '2027-03-09', 'p_ask', 'cl_k', 'team',
+                     NULL, NULL, 'Billing handover', 'Billing for Kestrel Test moves to Lucas One.',
+                     'Billing for Kestrel Test moves to Lucas One.', 0, 0, 0),
+                    ('r_task_k', 2, 6, 'org_vx', 'task', '2027-03-09T09:00:00Z', '2027-03-09', 'p_ask', 'cl_k', 'team',
+                     NULL, NULL, 'Fix Kestrel webhook', 'Webhook timeout patch underway.',
+                     'Webhook timeout patch underway.', 0, 0, 0)
+                    """,
+                    (filler_body, filler_body, is_bp),
+                )
+                conn.execute(
+                    "UPDATE records SET task_id = 'tk_1' WHERE id = 'r_task_k'"
+                )
+                conn.execute(
+                    "INSERT INTO tasks_state(task_id, org, client, title, owner, due, status, created_at_utc, created_record_id) "
+                    "VALUES ('tk_1', 'org_vx', 'cl_k', 'Fix Kestrel webhook', 'p_l2', '2027-03-14', 'in_progress', '2027-03-09T09:00:00Z', 'r_task_k')"
+                )
+                mark_day_ingested(conn, 2)
+                extract_entities_for_day(conn, 2)
+                rebuild_claims(conn)
+                conn.commit()
+
+                out_during = answer_question(conn, "p_ask", "2027-03-11T18:00:00Z", "Is Priya available today?")
+                self.assertIn("leave", out_during["answer"]["text"].lower())
+                self.assertIn("10 Mar", out_during["answer"]["text"])
+
+                out_after = answer_question(conn, "p_ask", "2027-03-13T18:00:00Z", "Is Priya available today?")
+                self.assertIn("available", out_after["answer"]["text"].lower())
+                self.assertIn("ended", out_after["answer"]["text"].lower())
+
+                pm = resolve_person_mention(conn, "p_ask", "Which Lucas for Kestrel Test?", upto_day=2, client_id="cl_k")
+                self.assertEqual(pm["person_id"], "p_l2")
+                self.assertNotIn("r_doc_bp", pm["sources"])
+
+                out_priv = answer_question(
+                    conn, "p_ask", "2027-03-10T18:00:00Z", "Is Lucas One travelling or having any surgery soon?"
+                )
+                self.assertEqual(out_priv["refused"], {"reason": "private"})
+
+                out_bill = answer_question(
+                    conn, "p_ask", "2027-03-10T18:00:00Z", "Who handles billing for Kestrel Test?"
+                )
+                self.assertIn("Lucas One", out_bill["answer"]["text"])
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

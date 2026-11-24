@@ -275,6 +275,64 @@ class BriefGeneratorTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_negative_utc_day1_watermark_and_org_isolated_doc_versions(self) -> None:
+        from src.brief import _compute_since_day, _day1_anchor_date
+        from src.db import mark_day_ingested, reset_db
+        from src.docs_engine import rebuild_doc_versions
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = os.path.join(tmpdir, "ny_wm.db")
+            reset_db(db_file)
+            conn = get_connection(db_file)
+            try:
+                conn.execute("INSERT INTO orgs(org_id, name) VALUES ('org_a', 'Org A'), ('org_b', 'Org B')")
+                conn.execute(
+                    "INSERT INTO people(person_id, org_id, name, first_name, last_name, role, team, zone) "
+                    "VALUES ('pa1', 'org_a', 'Elena NY', 'Elena', 'NY', 'manager', 'client', 'America/New_York'), "
+                    "('pb1', 'org_b', 'Omar B', 'Omar', 'B', 'manager', 'client', 'Asia/Dubai')"
+                )
+                conn.execute("INSERT INTO clients(client_id, org_id, name) VALUES ('acme', 'org_a', 'Acme Corp')")
+                conn.execute(
+                    """
+                    INSERT INTO records(
+                        id, day, line_no, org, type, at_utc, local_date, author, client, visibility,
+                        doc_id, version, title, body, sanitized_body, has_injection_span, is_boilerplate, is_newsletter
+                    ) VALUES
+                    ('r_ny_early', 1, 1, 'org_a', 'chat', '2027-04-05T03:30:00Z', '2027-04-04', 'pa1', 'acme', 'team',
+                     NULL, NULL, NULL, 'Early Day 1 chat', 'Early Day 1 chat', 0, 0, 0),
+                    ('r_ny_mid', 1, 2, 'org_a', 'note', '2027-04-05T14:00:00Z', '2027-04-05', 'pa1', 'acme', 'team',
+                     NULL, NULL, NULL, 'Decision: rollout phased over 2 weeks.', 'Decision: rollout phased over 2 weeks.', 0, 0, 0),
+                    ('r_doc_a1', 1, 3, 'org_a', 'doc', '2027-04-05T15:00:00Z', '2027-04-05', 'pa1', 'acme', 'team',
+                     'shared-roadmap', 1, 'Acme roadmap', 'Owner: Elena NY', 'Owner: Elena NY', 0, 0, 0),
+                    ('r_doc_a1_dup', 1, 4, 'org_a', 'doc', '2027-04-05T16:00:00Z', '2027-04-05', 'pa1', 'acme', 'team',
+                     'shared-roadmap', 1, 'Acme roadmap', 'Owner: Elena NY', 'Owner: Elena NY', 0, 0, 0),
+                    ('r_doc_b1', 1, 5, 'org_b', 'doc', '2027-04-05T15:30:00Z', '2027-04-05', 'pb1', NULL, 'team',
+                     'shared-roadmap', 1, 'Org B roadmap', 'Owner: Omar B', 'Owner: Omar B', 0, 0, 0),
+                    ('ev_ny_1', 1, 6, 'org_a', 'event', '2027-04-05T17:00:00Z', '2027-04-05', 'pa1', 'acme', 'team',
+                     NULL, NULL, 'Acme sync', 'Acme sync', 'Acme sync', 0, 0, 0)
+                    """
+                )
+                conn.execute(
+                    "UPDATE records SET event_id = 'ev-acme-01', start_utc = '2027-04-06T03:30:00Z', "
+                    "attendees_json = '[\"pa1\"]' WHERE id = 'ev_ny_1'"
+                )
+                mark_day_ingested(conn, 1)
+                rebuild_doc_versions(conn)
+                conn.commit()
+
+                self.assertEqual(_day1_anchor_date(conn), "2027-04-05")
+                dv_cnt = conn.execute("SELECT COUNT(*) FROM doc_versions WHERE doc_id = 'shared-roadmap'").fetchone()[0]
+                self.assertEqual(dv_cnt, 2)
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO brief_watermarks(person, client, meeting_date, prepared_day) "
+                    "VALUES ('pa1', 'acme', '2027-04-05', 1)"
+                )
+                since = _compute_since_day(conn, "pa1", "org_a", "America/New_York", "acme", "2027-04-06", 2)
+                self.assertEqual(since, 2)
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -225,6 +225,35 @@ class TestMemoryFeedbackAndForget(unittest.TestCase):
         finally:
             c6.close()
 
+    def test_day_start_utc_uses_dataset_canonical_dates(self) -> None:
+        from src.db import reset_db
+        from src.memory import _day_start_utc
+
+        db_dyn = os.path.join(self.tmpdir.name, "dyn_dates.db")
+        reset_db(db_dyn)
+        c_dyn = get_connection(db_dyn)
+        try:
+            c_dyn.execute("INSERT INTO orgs(org_id, name) VALUES ('org_t', 'Test Org')")
+            c_dyn.execute(
+                "INSERT INTO people(person_id, org_id, name, first_name, last_name, role, team, zone) "
+                "VALUES ('pt1', 'org_t', 'Pat Test', 'Pat', 'Test', 'manager', 'client', 'UTC')"
+            )
+            c_dyn.execute(
+                """
+                INSERT INTO records(
+                    id, day, line_no, org, type, at_utc, local_date, author, client,
+                    visibility, body, sanitized_body, has_injection_span, is_boilerplate, is_newsletter
+                ) VALUES
+                ('rt1', 1, 1, 'org_t', 'chat', '2027-03-08T05:00:00Z', '2027-03-08', 'pt1', NULL, 'team', 'Hi', 'Hi', 0, 0, 0),
+                ('rt2', 1, 2, 'org_t', 'chat', '2027-03-08T09:00:00Z', '2027-03-08', 'pt1', NULL, 'team', 'Update', 'Update', 0, 0, 0)
+                """
+            )
+            c_dyn.commit()
+            self.assertEqual(_day_start_utc(1, c_dyn), "2027-03-08T00:00:00Z")
+            self.assertEqual(_day_start_utc(3, c_dyn), "2027-03-10T00:00:00Z")
+        finally:
+            c_dyn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -98,6 +98,51 @@ def _match_client_record(rec: sqlite3.Row, client_id: str | None, alias_terms: s
     )
 
 
+def superseded_doc_sheet_ids(
+    conn: sqlite3.Connection,
+    person_id: str,
+    person_org: str,
+    upto_day: int,
+    upto_utc: str | None = None,
+) -> set[str]:
+    """Return record IDs of older visible doc/sheet versions superseded by a newer visible version."""
+    where = visible_records_where_clause("r", with_utc_cutoff=(upto_utc is not None))
+    params = visible_records_params(person_id, person_org, upto_day, upto_utc)
+    rows = conn.execute(
+        f"""
+        SELECT r.id, r.org, r.visibility, r.author, r.readers_json,
+               COALESCE(r.doc_id, r.sheet_id) AS artifact_id,
+               COALESCE(r.version, 1) AS ver, r.at_utc
+        FROM records r
+        WHERE r.type IN ('doc', 'sheet')
+          AND COALESCE(r.doc_id, r.sheet_id) IS NOT NULL
+          AND {where}
+        """,
+        params,
+    ).fetchall()
+
+    latest_by_art: dict[str, tuple[int, str, str]] = {}
+    all_ids_by_art: dict[str, list[str]] = {}
+    for row in rows:
+        if not can_view(row, person_id, person_org):
+            continue
+        aid = str(row["artifact_id"])
+        rid = str(row["id"])
+        cand = (int(row["ver"]), str(row["at_utc"]), rid)
+        all_ids_by_art.setdefault(aid, []).append(rid)
+        cur = latest_by_art.get(aid)
+        if cur is None or cand > cur:
+            latest_by_art[aid] = cand
+
+    superseded: set[str] = set()
+    for aid, ids in all_ids_by_art.items():
+        win_rid = latest_by_art[aid][2]
+        for rid in ids:
+            if rid != win_rid:
+                superseded.add(rid)
+    return superseded
+
+
 def search_fts5(
     conn: sqlite3.Connection,
     person_id: str,
@@ -157,6 +202,7 @@ def search_fts5(
     ).fetchall()
 
     kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
+    superseded_ids = superseded_doc_sheet_ids(conn, person_id, person_org, day_lim, upto_utc)
     min_base_hits = 2 if len(base_terms) >= 2 else 1
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -165,7 +211,7 @@ def search_fts5(
         if not _match_client_record(row, client_id, al_terms):
             continue
         rid = str(row["id"])
-        if rid in forgotten_ids:
+        if rid in forgotten_ids or rid in superseded_ids:
             continue
         blob = " ".join(str(x or "") for x in (row["title"], row["subject"], row["sanitized_body"])).lower()
         if _text_matches_forgotten(blob, kw_groups):
@@ -282,9 +328,10 @@ def search_hybrid(
         return []
 
     kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
+    superseded_ids = superseded_doc_sheet_ids(conn, person_id, person_org, day_lim, upto_utc)
     fused: list[dict[str, Any]] = []
     for rid in all_ids:
-        if rid in forgotten_ids:
+        if rid in forgotten_ids or rid in superseded_ids:
             continue
         fhit = fts_by_id.get(rid)
         vhit = vec_by_id.get(rid)

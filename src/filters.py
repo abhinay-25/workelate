@@ -230,5 +230,25 @@ def classify_noise(record: dict[str, Any], sanitized_body: str) -> tuple[int, in
         ]
         if not non_header:
             is_boilerplate = 1
+        else:
+            all_sents = [c for line in non_header for c in _split_clauses(line)]
+            has_structured = any(
+                re.match(r"^[A-Za-z][A-Za-z0-9 /_-]{1,35}:\s+\S", line)
+                for line in non_header
+            ) or bool(
+                re.search(
+                    r"\b(?:\d{4}-\d{2}-\d{2}|"
+                    r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*|"
+                    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2})\b",
+                    sanitized_body,
+                    re.IGNORECASE,
+                )
+            )
+            if (
+                not has_structured
+                and len(all_sents) >= 8
+                and (len({s.lower() for s in all_sents}) / len(all_sents)) <= 0.65
+            ):
+                is_boilerplate = 1
 
     return is_boilerplate, is_newsletter

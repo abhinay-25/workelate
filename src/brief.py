@@ -6,12 +6,14 @@ import sqlite3
 from datetime import date, datetime
 from typing import Any
 
-from src.claims import get_claim_changes_in_window
+from src.claims import get_claim_changes_in_window, is_unverified_or_hedged_clause
 from src.llm import LLMClient
 from src.memory import get_person_preferences
-from src.promises import get_open_promises
+from src.promises import get_fulfilled_promises_in_window, get_open_promises
 from src.retrieval import search_hybrid
 from src.security import (
+    _get_forgotten_entries,
+    _text_matches_forgotten,
     get_current_day,
     get_person_org,
     get_person_row,
@@ -34,7 +36,8 @@ _BRIEF_SYSTEM_PROMPT = (
     "You are extracting concise factual changes for a workplace client meeting brief. "
     "Given <workplace_record> items since the attendee's last meeting for that client, "
     "identify only concrete substantive changes (blockers, status updates, deadline shifts, "
-    "ownership changes, scope decisions). Ignore small talk, greetings, and newsletters. "
+    "ownership changes, scope decisions). Ignore casual chatter, small talk, greetings, newsletters, "
+    "tentative speculation/hedges, and restatements of already-known baseline docs. "
     "Every claim must be strictly grounded in the provided XML text and cite exact record IDs. "
     'Return JSON only: {"changed": [{"text": "...", "kind": "blocked"|"decision"|"owner"|"date"|"status", "sources": ["record_id"]}]} '
     "or {\"changed\": []} if nothing substantive changed."
@@ -65,11 +68,12 @@ def _format_person_name(raw_val: str | None, people_map: dict[str, str]) -> str:
     return txt
 
 
-def _format_short_date(raw_val: str | None) -> str:
+def _format_short_date(raw_val: str | None, default_year: int | None = None) -> str:
     txt = str(raw_val or "").strip()
     if not txt:
         return ""
-    iso = txt if re.fullmatch(r"\d{4}-\d{2}-\d{2}", txt) else parse_explicit_date(txt, 2026)
+    fallback_y = default_year if default_year is not None else date.today().year
+    iso = txt if re.fullmatch(r"\d{4}-\d{2}-\d{2}", txt) else parse_explicit_date(txt, fallback_y)
     if iso:
         try:
             d = date.fromisoformat(iso)
@@ -93,8 +97,16 @@ def _content_tokens(text: str) -> set[str]:
 
 
 def _day1_anchor_date(conn: sqlite3.Connection) -> str:
+    """Return the canonical UTC start date of Day 1 using majority voting across day=1 records."""
     row = conn.execute(
-        "SELECT MIN(local_date) FROM records WHERE day = 1 AND local_date != ''"
+        """
+        SELECT SUBSTR(at_utc, 1, 10) AS d
+        FROM records
+        WHERE day = 1 AND at_utc != ''
+        GROUP BY d
+        ORDER BY COUNT(*) DESC, d ASC
+        LIMIT 1
+        """
     ).fetchone()
     if row and row[0]:
         return str(row[0])
@@ -148,6 +160,17 @@ def _compute_since_day(
         return 1
 
     last_prev_date = max(prev_local_dates)
+    wm = conn.execute(
+        """
+        SELECT MAX(prepared_day)
+        FROM brief_watermarks
+        WHERE person = ? AND client = ? AND meeting_date = ?
+        """,
+        (person_id, client_id, last_prev_date),
+    ).fetchone()
+    if wm and wm[0] is not None:
+        return max(1, int(wm[0]) + 1)
+
     cached_prev = conn.execute(
         "SELECT MAX(day) FROM brief_cache WHERE person = ? AND date = ?",
         (person_id, last_prev_date),
@@ -375,7 +398,7 @@ def _sort_changes(
     blockers_first: bool,
     keep_topics: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    kind_order = {"blocked": 0, "owner": 1, "decision": 2, "date": 3, "status": 4}
+    kind_order = {"blocked": 0, "owner": 1, "decision": 2, "date": 3, "status": 4, "delivered": 5}
     keeps = [str(k).lower().strip() for k in (keep_topics or []) if str(k).strip()]
 
     def _key(it: dict[str, Any]) -> tuple[int, int, int, int, str]:
@@ -432,8 +455,10 @@ def _llm_fallback_changes(
     tracker: UsageTracker,
     llm_client: LLMClient,
     ignore_topics: list[str],
+    exclude_ids: set[str] | None = None,
+    is_supplement: bool = False,
 ) -> list[dict[str, Any]]:
-    """Use Groq primary / Gemini secondary only when structured extraction found 0 changes."""
+    """Use configured LLM chain for uncovered substantive records after deterministic extraction."""
     if not llm_client.configured_providers():
         return []
 
@@ -457,35 +482,57 @@ def _llm_fallback_changes(
               SELECT fulfilled_by_record_id FROM promises
               WHERE fulfilled_by_record_id IS NOT NULL AND is_forgotten = 0
           )
+          AND r.id NOT IN (
+              SELECT source_record_id FROM claims
+              WHERE source_record_id IS NOT NULL AND is_forgotten = 0
+          )
           AND {where}
         ORDER BY r.at_utc DESC
-        LIMIT 25
+        LIMIT 30
         """,
         params,
     ).fetchall()
 
-    if not rows:
+    excluded = exclude_ids or set()
+    kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
+    candidate_rows: list[sqlite3.Row] = []
+    for rr in rows:
+        rid = str(rr["id"])
+        if rid in excluded or rid in forgotten_ids:
+            continue
+        body_txt = str(rr["sanitized_body"] or "").strip()
+        if len(body_txt.split()) < 5:
+            continue
+        blob = f"{rr['title'] or ''} {rr['subject'] or ''} {body_txt}"
+        if kw_groups and _text_matches_forgotten(blob, kw_groups):
+            continue
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", body_txt) if s.strip()]
+        if sentences and all(is_unverified_or_hedged_clause(s) for s in sentences):
+            continue
+        candidate_rows.append(rr)
+
+    if not candidate_rows:
         return []
 
-    rec_by_id = {str(r["id"]): r for r in rows}
+    rec_by_id = {str(r["id"]): r for r in candidate_rows}
     valid_ids = set(rec_by_id.keys())
 
     # Prioritize semantically substantive client updates via hybrid retrieval before token-budget packing
-    ordered_rows = list(rows)
-    if len(rows) > 1:
+    ordered_rows = list(candidate_rows)
+    if len(candidate_rows) > 1:
         hyb = search_hybrid(
             conn,
             person_id,
             "blocked delay deadline launch billing owner scope decision approval issue",
             client_id=client_id,
             upto_day=upto_day,
-            limit=len(rows),
+            limit=len(candidate_rows),
             tracker=tracker,
         )
         ranked_ids = [h["record_id"] for h in hyb if h["record_id"] in valid_ids]
         if ranked_ids:
             seen_r = set(ranked_ids)
-            ordered_rows = [rec_by_id[rid] for rid in ranked_ids] + [r for r in rows if str(r["id"]) not in seen_r]
+            ordered_rows = [rec_by_id[rid] for rid in ranked_ids] + [r for r in candidate_rows if str(r["id"]) not in seen_r]
 
     user_prompt, count = pack_records_within_budget(
         ordered_rows,
@@ -516,6 +563,8 @@ def _llm_fallback_changes(
         if not text or not srcs:
             continue
         if ignores and any(ig in text.lower() for ig in ignores):
+            continue
+        if kw_groups and _text_matches_forgotten(text, kw_groups):
             continue
         if not _is_change_grounded_in_records(text, srcs, rec_by_id):
             continue
@@ -663,7 +712,9 @@ def generate_briefs_for_person_date(
         )
         task_items = [_format_task_change(tc, people_map) for tc in raw_tasks]
 
+        raw_claims = []
         claim_items: list[dict[str, Any]] = []
+        delivered_items: list[dict[str, Any]] = []
         if cid is not None:
             raw_claims = get_claim_changes_in_window(
                 conn,
@@ -678,11 +729,32 @@ def generate_briefs_for_person_date(
                 if fmt is not None:
                     claim_items.append(fmt)
 
-        merged_unfiltered = _deduplicate_changes(claim_items, task_items, raw_tasks)
-        merged = _filter_by_preferences(merged_unfiltered, prefs)
+            for dp in get_fulfilled_promises_in_window(conn, person_id, cid, since_day, current_day):
+                owner_name = _format_person_name(dp["owner"], people_map)
+                delivered_items.append(
+                    {
+                        "text": f"{owner_name} delivered {dp['what']}",
+                        "sources": [dp["record_id"]],
+                        "prio": 3,
+                        "kind": "delivered",
+                        "at_utc": dp["at_utc"],
+                        "title": dp["what"],
+                        "new_val": dp["what"],
+                    }
+                )
 
-        if not merged_unfiltered and cid is not None:
-            merged = _llm_fallback_changes(
+        merged_unfiltered = _deduplicate_changes(claim_items, task_items, raw_tasks)
+        existing_sources = {str(s) for it in merged_unfiltered for s in it.get("sources") or []}
+        existing_texts = {str(it["text"]).strip().lower() for it in merged_unfiltered}
+        for di in delivered_items:
+            if di["sources"][0] in existing_sources or di["text"].strip().lower() in existing_texts:
+                continue
+            merged_unfiltered.append(di)
+            existing_sources.update(str(s) for s in di["sources"])
+            existing_texts.add(di["text"].strip().lower())
+
+        if cid is not None:
+            llm_extra = _llm_fallback_changes(
                 conn,
                 person_id,
                 person_org,
@@ -692,7 +764,18 @@ def generate_briefs_for_person_date(
                 tracker,
                 client,
                 prefs.get("ignore_topics") or [],
+                exclude_ids=existing_sources if merged_unfiltered else None,
+                is_supplement=bool(merged_unfiltered),
             )
+            for li in llm_extra:
+                ltxt = str(li["text"]).strip().lower()
+                if ltxt in existing_texts or all(str(s) in existing_sources for s in li.get("sources") or []):
+                    continue
+                merged_unfiltered.append(li)
+                existing_sources.update(str(s) for s in li.get("sources") or [])
+                existing_texts.add(ltxt)
+
+        merged = _filter_by_preferences(merged_unfiltered, prefs)
 
         ordered = _sort_changes(
             merged,
@@ -712,6 +795,15 @@ def generate_briefs_for_person_date(
         }
         pre_validated = validate_brief_list(conn, [pre_check], person_id, current_day)[0]
         clean_changed_dicts = pre_validated.get("changed") or []
+
+        if cid is not None:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO brief_watermarks(person, client, meeting_date, prepared_day)
+                VALUES (?, ?, ?, ?)
+                """,
+                (person_id, cid, date_str, current_day),
+            )
 
         if not clean_changed_dicts:
             raw_briefs.append(

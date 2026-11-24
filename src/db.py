@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS doc_versions (
     extracted_kv_json TEXT NOT NULL,
     diff_summary_json TEXT,
     is_forgotten INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (doc_id, version)
+    PRIMARY KEY (org, doc_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS promises (
@@ -290,6 +290,19 @@ CREATE TABLE IF NOT EXISTS brief_cache (
     day INTEGER NOT NULL,
     response_json TEXT NOT NULL,
     PRIMARY KEY (person, date, day)
+);
+
+CREATE TABLE IF NOT EXISTS brief_watermarks (
+    person TEXT NOT NULL,
+    client TEXT NOT NULL,
+    meeting_date TEXT NOT NULL,
+    prepared_day INTEGER NOT NULL,
+    PRIMARY KEY (person, client, meeting_date)
+);
+
+CREATE TABLE IF NOT EXISTS llm_claim_cache (
+    record_id TEXT PRIMARY KEY,
+    parsed_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS record_vectors (

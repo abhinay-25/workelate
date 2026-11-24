@@ -15,7 +15,7 @@ from src.entities import (
 )
 from src.llm import LLMClient
 from src.promises import get_open_promises
-from src.retrieval import search_hybrid
+from src.retrieval import search_hybrid, superseded_doc_sheet_ids
 from src.retrieval.hybrid import ANALYTICAL_META_WORDS, _HINGLISH_STOPWORDS
 from src.security import (
     _get_forgotten_entries,
@@ -48,8 +48,9 @@ from src.usage import ASK_TOKEN_LIMIT, UsageTracker, pack_records_within_budget
 _ASK_SYSTEM_PROMPT = (
     "You are answering a colleague's workplace question strictly from the provided <workplace_record> XML entries. "
     "Cite exact record IDs from the provided XML in sources. Never extrapolate, guess, or mention private information. "
-    "If the provided records do not answer the question, respond with {\"answer\": \"I have nothing on that.\", \"sources\": []}. "
-    "Return JSON only: {\"answer\": \"...\", \"sources\": [\"record_id\"]}."
+    "If the provided records do not specifically answer what was asked, do not substitute unrelated items — respond with "
+    '{"answer": "I have nothing on that.", "sources": []}. '
+    'Return JSON only: {"answer": "...", "sources": ["record_id"]}.'
 )
 
 _ASK_ANALYTICAL_SYSTEM_PROMPT = (
@@ -115,6 +116,8 @@ _QUESTION_STOPWORDS = frozenset(
         "handle", "handles", "handling", "responsible", "manage", "manages",
         "managing", "lead", "leads", "charge", "contact", "current", "currently",
         "latest", "update", "updates", "status",
+        "having", "getting", "going", "making", "taking", "doing", "soon",
+        "recently", "ever", "already", "anyone", "someone",
     }
 ) | _HINGLISH_STOPWORDS
 
@@ -141,11 +144,12 @@ _STATUS_TEXT = {
 }
 
 
-def _format_short_date(iso_or_text: str | None) -> str:
+def _format_short_date(iso_or_text: str | None, default_year: int | None = None) -> str:
     txt = str(iso_or_text or "").strip()
     if not txt:
         return ""
-    iso = txt if re.fullmatch(r"\d{4}-\d{2}-\d{2}", txt) else parse_explicit_date(txt, 2026)
+    fallback_y = default_year if default_year is not None else date.today().year
+    iso = txt if re.fullmatch(r"\d{4}-\d{2}-\d{2}", txt) else parse_explicit_date(txt, fallback_y)
     if iso:
         try:
             d = date.fromisoformat(iso)
@@ -206,17 +210,28 @@ def _matches_person_forgotten_topic(conn: sqlite3.Connection, person_id: str, as
     return False
 
 
-def _topic_terms_from_question(ask_text: str, extra_ignore: set[str]) -> list[str]:
+def _topic_term_groups_from_question(ask_text: str, extra_ignore: set[str]) -> list[list[str]]:
     words = re.findall(r"[a-z]{3,}", (ask_text or "").lower())
-    terms: list[str] = []
+    groups: list[list[str]] = []
+    seen_roots: set[str] = set()
     for w in words:
-        if w in _QUESTION_STOPWORDS or w in extra_ignore:
+        if w in _QUESTION_STOPWORDS or w in extra_ignore or w in seen_roots:
             continue
-        if w not in terms:
-            terms.append(w)
+        seen_roots.add(w)
+        grp = [w]
         for syn in _TOPIC_SYNONYMS.get(w, ()):
-            if syn not in terms:
-                terms.append(syn)
+            if syn not in grp:
+                grp.append(syn)
+        groups.append(grp)
+    return groups
+
+
+def _topic_terms_from_question(ask_text: str, extra_ignore: set[str]) -> list[str]:
+    terms: list[str] = []
+    for grp in _topic_term_groups_from_question(ask_text, extra_ignore):
+        for t in grp:
+            if t not in terms:
+                terms.append(t)
     return terms
 
 
@@ -285,22 +300,21 @@ def _check_privacy_refusal(
                 ):
                     return True
 
-    # 2. Colleague activity/opinion check (e.g. "Is Alice travelling anywhere this month?")
+    # 2. Colleague activity/opinion check (e.g. "Is Alice travelling or having any surgery soon?")
     if cand_ids:
         ignore: set[str] = set()
         for aid in cand_ids:
             if aid in people_map:
                 ignore.update(str(people_map[aid]["name"]).lower().split())
-        topic_terms = _topic_terms_from_question(ask_text, ignore)
-        if topic_terms:
+        for term_group in _topic_term_groups_from_question(ask_text, ignore):
             has_visible = any(
-                _has_visible_person_match(conn, person_id, person_org, aid, topic_terms, upto_day, upto_utc)
+                _has_visible_person_match(conn, person_id, person_org, aid, term_group, upto_day, upto_utc)
                 for aid in cand_ids
             )
             if not has_visible:
                 for aid in cand_ids:
                     if has_inaccessible_record_on_topic(
-                        conn, person_id, aid, topic_terms, upto_day=upto_day, upto_utc=upto_utc
+                        conn, person_id, aid, term_group, upto_day=upto_day, upto_utc=upto_utc
                     ):
                         return True
 
@@ -323,7 +337,11 @@ def _extract_target_due_from_question(ask_text: str, at_utc: str, zone_name: str
             return resolve_query_weekday(wd, at_utc, zone_name)
     if re.search(r"\b(today|tomorrow|kal|aaj|next\s+\w+)\b", low):
         return resolve_relative_due_date(ask_text, at_utc, zone_name)
-    return parse_explicit_date(ask_text, 2026)
+    try:
+        ref_year = int(str(at_utc)[:4])
+    except ValueError:
+        ref_year = date.today().year
+    return parse_explicit_date(ask_text, ref_year)
 
 
 def _format_owner_name(raw_val: str, people_map: dict[str, sqlite3.Row]) -> tuple[str | None, str]:
@@ -485,8 +503,16 @@ def _handle_leave_question(
         )
     )
     has_person_avail = bool(
-        re.search(r"\b(?:is|are|will)\s+[A-Z][a-z]+[^?]*\b(?:available|availability|leave|ooo)\b", ask_text)
-        or re.search(r"\b(?:availability\s+of|leave\s+dates|leave\s+schedule)\b", ask_text, re.IGNORECASE)
+        re.search(
+            r"\b(?:is|are|will)\s+[A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)?[^?]*\b(?:available|availability|leave|ooo|out\s+of\s+office|away|back)\b",
+            ask_text,
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(?:availability\s+of|leave\s+dates|leave\s+schedule|when\s+is\s+[A-Za-z]+\s+(?:back|on\s+leave|available))\b",
+            ask_text,
+            re.IGNORECASE,
+        )
     )
     if not (has_explicit_leave or has_person_avail):
         return None
@@ -635,9 +661,11 @@ def _gather_analytical_evidence(
     limit: int = 10,
     past_window: tuple[str, str] | None = None,
     person_zone: str = DEFAULT_ZONE,
+    target_author: str | None = None,
 ) -> tuple[list[sqlite3.Row], str]:
     """Gather authorized, non-forgotten, non-tainted evidence records + state summary for LLM synthesis."""
     kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
+    superseded_ids = superseded_doc_sheet_ids(conn, person_id, person_org, upto_day, upto_utc)
     tainted = _tainted_phrases(conn)
     where = visible_records_where_clause("r", with_utc_cutoff=True)
     params = visible_records_params(person_id, person_org, upto_day, upto_utc)
@@ -646,7 +674,7 @@ def _gather_analytical_evidence(
         if rec is None:
             return False
         rid = str(rec["id"])
-        if rid in forgotten_ids or not can_view(rec, person_id, person_org):
+        if rid in forgotten_ids or rid in superseded_ids or not can_view(rec, person_id, person_org):
             return False
         if int(rec["day"]) > upto_day or int(rec["is_forgotten"]) != 0:
             return False
@@ -686,7 +714,7 @@ def _gather_analytical_evidence(
         return False
 
     def _fetch_rec(rid: str | None) -> sqlite3.Row | None:
-        if not rid or rid in forgotten_ids:
+        if not rid or rid in forgotten_ids or rid in superseded_ids:
             return None
         return conn.execute("SELECT * FROM records WHERE id = ?", (str(rid),)).fetchone()
 
@@ -695,6 +723,25 @@ def _gather_analytical_evidence(
     # 1. Top 3 hybrid search hits most relevant to question terms (leave room for structured state records)
     for h in hybrid_hits[:3]:
         _add_rec(h.get("record"))
+
+    # 1b. If a specific colleague was mentioned, prioritize their non-boilerplate visible records
+    if target_author:
+        auth_params = dict(params)
+        auth_params["auth"] = target_author
+        for ar in conn.execute(
+            f"""
+            SELECT r.* FROM records r
+            WHERE r.author = :auth
+              AND r.is_boilerplate = 0
+              AND r.is_newsletter = 0
+              AND TRIM(COALESCE(r.sanitized_body, '')) != ''
+              AND {where}
+            ORDER BY r.at_utc DESC
+            LIMIT 4
+            """,
+            auth_params,
+        ).fetchall():
+            _add_rec(ar)
 
     # 2. Event-sourced blocked & active tasks visible to person_id
     tasks = get_visible_tasks_at(conn, person_id, upto_day=upto_day, upto_utc=upto_utc, client_id=cid)
@@ -705,7 +752,7 @@ def _gather_analytical_evidence(
             str(t.get("due") or "9999-99-99"),
         ),
     )
-    for t in sorted_tasks[:8]:
+    for t in sorted_tasks[: (4 if target_author else 8)]:
         src = t.get("last_status_record_id") or t.get("last_owner_record_id") or t.get("created_record_id")
         srec = _fetch_rec(src)
         if not _is_safe_rec(srec):
@@ -721,13 +768,20 @@ def _gather_analytical_evidence(
             line += f" | reason={t['blocked_reason']}"
         state_lines.append(line)
 
-    # 3. Winning structured claims (billing owners, launch dates, decisions)
+    # 3. Winning structured claims (billing owners, launch dates, decisions, leave windows)
     subj_sql = "SELECT DISTINCT subject_key FROM claims WHERE org = ? AND is_forgotten = 0 AND day <= ?"
     subj_args: list[Any] = [person_org, upto_day]
     if cid:
         subj_sql += " AND client = ?"
         subj_args.append(cid)
-    for srow in conn.execute(subj_sql, subj_args).fetchall():
+    subj_rows = sorted(
+        conn.execute(subj_sql, subj_args).fetchall(),
+        key=lambda r: (
+            0 if target_author and str(r["subject_key"]).startswith(f"{target_author}:") else 1,
+            str(r["subject_key"]),
+        ),
+    )
+    for srow in subj_rows:
         sk = str(srow["subject_key"])
         win = get_winning_claim(
             conn, person_id, sk, upto_day=upto_day, upto_utc=upto_utc, query_date=query_local_date
@@ -751,7 +805,14 @@ def _gather_analytical_evidence(
         val_disp = str(win["object_val"])
         if win.get("predicate") == "owner":
             _, val_disp = _format_owner_name(val_disp, people_map)
-        state_lines.append(f"- Claim [{first_seen}]: {sk} -> {val_disp}")
+        elif win.get("predicate") == "leave" and (win.get("valid_from") or win.get("valid_until")):
+            val_disp = f"{val_disp} (window: {win.get('valid_from') or '?'} to {win.get('valid_until') or '?'})"
+        disp_subject = sk
+        if ":" in sk:
+            pfx, rest = sk.split(":", 1)
+            if pfx in people_map:
+                disp_subject = f"{people_map[pfx]['name']} ({pfx}): {rest}"
+        state_lines.append(f"- Claim [{first_seen}]: {disp_subject} -> {val_disp}")
 
     # 4. Open commitments / promises
     promises = get_open_promises(conn, person_id, client_id=cid, upto_day=upto_day, upto_utc=upto_utc)
@@ -789,6 +850,8 @@ def _gather_analytical_evidence(
             params,
         ).fetchall()
         for rr in rec_rows:
+            if str(rr["id"]) in superseded_ids:
+                continue
             _add_rec(rr)
             if len(chosen) >= limit:
                 break
@@ -814,10 +877,12 @@ def _search_and_synthesize_fallback(
     task_matches: list[dict[str, Any]] | None = None,
     past_window: tuple[str, str] | None = None,
     person_zone: str = DEFAULT_ZONE,
+    allow_raw_state_fallback: bool = True,
 ) -> dict[str, Any] | None:
     """Search visible non-forgotten non-boilerplate records and synthesize concisely (LLM if configured)."""
     where = visible_records_where_clause("r", with_utc_cutoff=True)
     params = visible_records_params(person_id, person_org, upto_day, upto_utc)
+    superseded_ids = superseded_doc_sheet_ids(conn, person_id, person_org, upto_day, upto_utc)
 
     rows = conn.execute(
         f"""
@@ -831,6 +896,7 @@ def _search_and_synthesize_fallback(
         """,
         params,
     ).fetchall()
+    rows = [r for r in rows if str(r["id"]) not in superseded_ids]
     if not rows:
         return None
 
@@ -886,6 +952,7 @@ def _search_and_synthesize_fallback(
         asks_self=asks_self,
         tracker=tracker,
     )
+    hybrid_hits = [h for h in hybrid_hits if str(h.get("record_id")) not in superseded_ids]
     if past_window is not None:
         start_d, end_d = past_window
         target_hits = 8 if force_llm else 6
@@ -910,7 +977,9 @@ def _search_and_synthesize_fallback(
             ask_text, cid, task_matches or [], hybrid_hits, people_map
         ):
             return None
-        # Ensure any unknown explicit proper/project tokens not in corpus aren't silently bypassed
+        # Keep out-of-scope guard when NO known org client/person/task/hybrid match was found;
+        # never let unfamiliar Hinglish/paraphrase words block LLM when a known entity IS scoped.
+        has_known_entity = bool(cid or target_author or task_matches or hybrid_hits)
         min_unmapped_len = 5 if (cid and _ANALYTICAL_INTENT_RE.search(ask_text)) else 4
         unmapped_q = [
             w for w in base_terms
@@ -918,7 +987,7 @@ def _search_and_synthesize_fallback(
             and w not in ANALYTICAL_META_WORDS
             and w not in _SAFE_WORKPLACE_UNMAPPED
         ]
-        if unmapped_q and not hybrid_hits:
+        if unmapped_q and not has_known_entity:
             any_visible_match = any(
                 any(
                     re.search(r"(?<![a-z0-9])" + re.escape(uq) + r"(?![a-z0-9])",
@@ -946,6 +1015,7 @@ def _search_and_synthesize_fallback(
             limit=10,
             past_window=past_window,
             person_zone=person_zone,
+            target_author=target_author,
         )
         if not top_recs:
             return None
@@ -1016,7 +1086,7 @@ def _search_and_synthesize_fallback(
 
     # Use live LLM chain when analytical synthesis is requested, explicitly requested, or prose > 3 sentences
     if (force_llm or explicit_llm or len(sentences) > 3) and llm_client.configured_providers():
-        sys_prompt = _ASK_ANALYTICAL_SYSTEM_PROMPT if force_llm else _ASK_SYSTEM_PROMPT
+        sys_prompt = _ASK_ANALYTICAL_SYSTEM_PROMPT if (force_llm and allow_raw_state_fallback) else _ASK_SYSTEM_PROMPT
         tz_ctx = ""
         if past_window is not None:
             loc_d = query_local_date or at_utc_to_date(upto_utc)
@@ -1065,6 +1135,9 @@ def _search_and_synthesize_fallback(
                         "_semantic_only": semantic_only,
                     }
 
+    if force_llm and not allow_raw_state_fallback:
+        return None
+
     if force_llm and state_context:
         # Clean deterministic multi-point fallback if offline / all LLM tiers unavailable
         safe_lines = [ln.lstrip("- ").strip() for ln in state_context.splitlines()[:4] if ln.strip()]
@@ -1082,6 +1155,9 @@ def _search_and_synthesize_fallback(
                 "usage": tracker.to_dict(),
                 "_semantic_only": semantic_only,
             }
+
+    if force_llm:
+        return None
 
     # Deterministic fallback: strip advisory suffixes like "Don't tell the team yet" and return core sentence
     best_sents = [
@@ -1536,9 +1612,81 @@ def answer_question(
         r"(?:launch|go[\s-]?live|release)\s+(?:date|schedule|day|moved|pushed|delayed|shifted)|"
         r"(?:date|schedule)\s+(?:of|for)\s+(?:the\s+)?(?:\w+\s+)?(?:launch|go[\s-]?live|release))\b"
     )
+    asks_owner_claim = bool(
+        re.search(
+            r"\b(?:who\s+(?:owns|handles|leads|manages|runs|is\s+(?:in\s+charge|responsible|leading|handling|owning))|"
+            r"owner\s+of|lead\s+(?:for|of)|contact\s+for)\b",
+            low_q,
+        )
+    )
+    asks_date_claim = bool(
+        re.search(
+            r"\b(?:when\s+is|what(?:'s|\s+is)\s+the\s+.*?\bdate\b|date\s+(?:for|of)|scheduled\s+for)\b",
+            low_q,
+        )
+    )
+    asks_field_claim = bool(
+        re.search(r"\b(?:what(?:'s|\s+is|\s+was)|how\s+(?:long|much|many)|tell\s+me)\b", low_q)
+        and not re.search(r"\b(?:promis(?:e|ed|es)|commit(?:ment|ted|ments)|owed|owe|available|availability|leave|status)\b", low_q)
+    )
+
+    def _find_client_claim_subject(target_cid: str | None) -> str | None:
+        allowed_preds: set[str] = set()
+        if asks_owner_claim:
+            allowed_preds.add("owner")
+        if asks_date_claim:
+            allowed_preds.update(("date", "field_update", "doc_field"))
+        if asks_field_claim:
+            allowed_preds.update(("field_update", "doc_field"))
+        if not target_cid or not allowed_preds:
+            return None
+
+        subj_candidates = conn.execute(
+            """
+            SELECT DISTINCT subject_key, predicate
+            FROM claims
+            WHERE org = ? AND client = ? AND is_forgotten = 0 AND day <= ?
+            """,
+            (person_org, target_cid, current_day),
+        ).fetchall()
+        cli_skip = _client_ignore_tokens(conn, person_org, target_cid, client_res.get("phrase")) | {
+            "owner", "date", "lead", "contact", "for", "the", "of", "doc", "field",
+        }
+        best_sk: str | None = None
+        best_score = 0
+        best_tok_count = 0
+        for srow in subj_candidates:
+            pred = str(srow["predicate"])
+            if pred not in allowed_preds:
+                continue
+            sk = str(srow["subject_key"])
+            raw_slug = sk.split(":", 1)[-1]
+            if raw_slug.startswith("doc_field:"):
+                raw_slug = raw_slug.split(":", 1)[-1]
+            slug_toks = [
+                tok for tok in re.split(r"[^a-z0-9]+", raw_slug.lower())
+                if len(tok) >= 2 and tok not in cli_skip
+            ]
+            hits = sum(
+                1 for tok in slug_toks
+                if re.search(r"\b" + re.escape(tok) + r"\b", low_q)
+            )
+            if hits >= 1 and (hits > best_score or (hits == best_score and len(slug_toks) > best_tok_count)):
+                best_score = hits
+                best_tok_count = len(slug_toks)
+                best_sk = sk
+        return best_sk
+
+    weak_single_task = bool(task_matches and all(t.get("match_strength") == "single" for t in task_matches))
+    matched_client_claim_sk = (
+        _find_client_claim_subject(client_res.get("client_id"))
+        if (not task_matches or weak_single_task)
+        else None
+    )
     is_client_claim_q = (
         ("billing" in low_q and not any("billing" in t["title"].lower() for t in task_matches))
         or (bool(_launch_date_re.search(low_q)) and not any("launch" in t["title"].lower() for t in task_matches))
+        or (matched_client_claim_sk is not None and (not task_matches or weak_single_task))
     )
     if not is_analytical and (
         not task_matches
@@ -1607,7 +1755,7 @@ def answer_question(
         if resp:
             return validate_ask_response(conn, resp, person_id, current_day=current_day, at_utc=at_utc)
 
-    # Step 7: Leave / expiry & client claims (`billing`, `launch`)
+    # Step 7: Leave / expiry & client claims (`billing`, `launch`, `owner`, `field_update`, `doc_field`)
     leave_resp = (
         None
         if is_analytical
@@ -1675,83 +1823,34 @@ def answer_question(
                 }
                 return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
 
-        asks_owner = bool(
-            re.search(
-                r"\b(?:who\s+(?:owns|handles|leads|manages|runs|is\s+(?:in\s+charge|responsible|leading|handling|owning))|"
-                r"owner\s+of|lead\s+(?:for|of)|contact\s+for)\b",
-                low_q,
+        best_sk = matched_client_claim_sk or (_find_client_claim_subject(cid) if not task_matches else None)
+        if best_sk:
+            win = get_winning_claim(
+                conn, person_id, best_sk, upto_day=current_day, upto_utc=at_utc, query_date=query_local_date
             )
-        )
-        asks_date = bool(
-            re.search(
-                r"\b(?:when\s+is|what(?:'s|\s+is)\s+the\s+.*?\bdate\b|date\s+(?:for|of)|scheduled\s+for)\b",
-                low_q,
-            )
-        )
-        if (asks_owner or asks_date) and not task_matches:
-            allowed_preds = ("owner",) if asks_owner else ("date", "field_update")
-            subj_candidates = conn.execute(
-                """
-                SELECT DISTINCT subject_key, predicate
-                FROM claims
-                WHERE org = ? AND client = ? AND is_forgotten = 0 AND day <= ?
-                """,
-                (person_org, cid, current_day),
-            ).fetchall()
-            cli_skip = _client_ignore_tokens(conn, person_org, cid, client_res.get("phrase")) | {
-                "owner", "date", "lead", "contact", "for", "the", "of", "doc", "field",
-            }
-            best_sk: str | None = None
-            best_score = 0
-            best_tok_count = 0
-            for srow in subj_candidates:
-                pred = str(srow["predicate"])
-                if pred not in allowed_preds:
-                    continue
-                sk = str(srow["subject_key"])
-                raw_slug = sk.split(":", 1)[-1]
-                if raw_slug.startswith("doc_field:"):
-                    raw_slug = raw_slug.split(":", 1)[-1]
-                slug_toks = [
-                    tok for tok in re.split(r"[^a-z0-9]+", raw_slug.lower())
-                    if len(tok) >= 2 and tok not in cli_skip
-                ]
-                hits = sum(
-                    1 for tok in slug_toks
-                    if re.search(r"\b" + re.escape(tok) + r"\b", low_q)
+            if win:
+                ans_srcs = _safe_matched_sources(
+                    conn, win.get("sources"), person_id, person_org, current_day, at_utc
                 )
-                if hits >= 1 and (hits > best_score or (hits == best_score and len(slug_toks) > best_tok_count)):
-                    best_score = hits
-                    best_tok_count = len(slug_toks)
-                    best_sk = sk
-
-            if best_sk:
-                win = get_winning_claim(
-                    conn, person_id, best_sk, upto_day=current_day, upto_utc=at_utc, query_date=query_local_date
-                )
-                if win:
-                    ans_srcs = _safe_matched_sources(
-                        conn, win.get("sources"), person_id, person_org, current_day, at_utc
-                    )
-                    topic_lbl = best_sk.split(":", 1)[-1]
-                    if topic_lbl.startswith("doc_field:"):
-                        topic_lbl = topic_lbl.split(":", 1)[-1]
-                    topic_lbl = re.sub(r"(?:_owner|_date)$", "", topic_lbl).replace("_", " ").strip() or "this area"
-                    if win["predicate"] == "owner":
-                        opid, oname = _format_owner_name(win["object_val"], people_map)
-                        if opid:
-                            base_matched.append({"phrase": oname, "id": opid, "sources": ans_srcs})
-                        ans_text = f"{oname} handles {topic_lbl} for {cname}."
-                    else:
-                        ans_text = f"The {cname} {topic_lbl} is {win['object_val']}."
-                    out = {
-                        "answer": {"text": ans_text, "sources": ans_srcs},
-                        "matched": base_matched,
-                        "clarify": None,
-                        "refused": None,
-                        "usage": tracker.to_dict(),
-                    }
-                    return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
+                topic_lbl = best_sk.split(":", 1)[-1]
+                if topic_lbl.startswith("doc_field:"):
+                    topic_lbl = topic_lbl.split(":", 1)[-1]
+                topic_lbl = re.sub(r"(?:_owner|_date)$", "", topic_lbl).replace("_", " ").strip() or "this area"
+                if win["predicate"] == "owner":
+                    opid, oname = _format_owner_name(win["object_val"], people_map)
+                    if opid:
+                        base_matched.append({"phrase": oname, "id": opid, "sources": ans_srcs})
+                    ans_text = f"{oname} handles {topic_lbl} for {cname}."
+                else:
+                    ans_text = f"The {cname} {topic_lbl} is {win['object_val']}."
+                out = {
+                    "answer": {"text": ans_text, "sources": ans_srcs},
+                    "matched": base_matched,
+                    "clarify": None,
+                    "refused": None,
+                    "usage": tracker.to_dict(),
+                }
+                return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
 
     # Step 8: Open promises & commitments
     if not is_analytical and re.search(r"\b(?:promis(?:e|ed|es)|commit(?:ment|ted|ments)|owed|owe|deliverables?\s+pending)\b", low_q):
@@ -1892,7 +1991,7 @@ def answer_question(
             }
             return validate_ask_response(conn, out, person_id, current_day=current_day, at_utc=at_utc)
 
-    # Selective LLM intent interpretation & general NL fallback when deterministic paths didn't resolve
+    # Selective LLM intent interpretation & general NL pass-through when deterministic paths didn't resolve
     if not is_analytical and past_window is None and llm.configured_providers():
         intent_regex_hit = bool(
             re.search(
@@ -1902,10 +2001,15 @@ def answer_question(
                 low_q,
             )
         )
+        target_person_res = resolve_person_mention(
+            conn, person_id, ask_text, upto_day=current_day, upto_utc=at_utc, client_id=cid, exclude_asker=False
+        )
+        has_target_person = bool(target_person_res.get("person_id"))
+        has_scoped_entity = bool(cid is not None or task_matches or has_target_person)
         allow_broad = (cid is not None or bool(task_matches)) and not _has_unknown_noncorpus_topic(
             conn, person_id, person_org, ask_text, cid, client_res.get("phrase"), current_day, at_utc
         )
-        if llm_client is not None or intent_regex_hit or allow_broad:
+        if llm_client is not None or intent_regex_hit or allow_broad or (has_scoped_entity and not has_hidden_topic):
             intent_resp = _llm_interpret_question_intent(
                 conn,
                 person_id,
@@ -1923,9 +2027,8 @@ def answer_question(
                 return validate_ask_response(conn, intent_resp, person_id, current_day=current_day, at_utc=at_utc)
 
             if (
-                llm_client is None
-                and allow_broad
-                and _has_workplace_analytical_scope(ask_text, cid, task_matches, [], people_map)
+                (llm_client is not None or allow_broad or (has_scoped_entity and not has_hidden_topic))
+                and (has_scoped_entity or _has_workplace_analytical_scope(ask_text, cid, task_matches, [], people_map))
             ):
                 nl_fallback = _search_and_synthesize_fallback(
                     conn,
@@ -1945,6 +2048,7 @@ def answer_question(
                     task_matches=task_matches,
                     past_window=past_window,
                     person_zone=person_zone,
+                    allow_raw_state_fallback=False,
                 )
                 if nl_fallback:
                     nl_fallback.pop("_semantic_only", None)

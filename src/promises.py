@@ -95,13 +95,17 @@ _DELIVERY_RE = re.compile(
 )
 
 _COMPLETED_DELIVERY_CUE_RE = re.compile(
-    r"\b(?:attached|attaching|shared|sent|sending|uploaded|delivered|here\s+is|here(?:'s|\s+are)|"
+    r"(?:^|[.!?\n]\s*)(?:sending|sharing|attaching)\b|"
+    r"\b(?:attached|attaching|shared|sent|uploaded|delivered|here\s+is|here(?:'s|\s+are)|"
     r"completed|finalized|bhej\s+d(?:i|ee|iy[ae])|share\s+kar\s+d(?:i|ee|iy[ae])|upload\s+kar\s+d(?:i|ee|iy[ae]))\b",
     re.IGNORECASE,
 )
 
 _NON_DELIVERY_GUARD_RE = re.compile(
-    r"\b(?:waiting\s+on|still\s+need|pending|overdue|blocked|haven['’]t|have\s+not|"
+    r"\b(?:waiting\s+on|still\s+(?:need|working|reviewing|finalizing|preparing|updating|checking|drafting|editing)|"
+    r"working\s+on|in\s+progress|before\s+(?:sending|sharing|uploading|delivering)|"
+    r"about\s+to\s+(?:send|share|upload)|almost\s+(?:done|ready)|nearly\s+(?:done|ready)|wip|"
+    r"pending|overdue|blocked|haven['’]t|have\s+not|"
     r"not\s+yet|will\s+(?:send|share|deliver|upload)|tomorrow|kal\s+tak|by\s+friday|by\s+monday)\b",
     re.IGNORECASE,
 )
@@ -495,3 +499,61 @@ def get_deliveries_in_window(
                 }
             )
     return deliveries
+
+
+def get_fulfilled_promises_in_window(
+    conn: sqlite3.Connection,
+    person_id: str,
+    client_id: str,
+    since_day: int,
+    upto_day: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return promises fulfilled via visible delivery records within [since_day, upto_day]."""
+    org = get_person_org(conn, person_id)
+    if not org or not client_id:
+        return []
+    day_lim = get_current_day(conn) if upto_day is None else upto_day
+    where = visible_records_where_clause("df", with_utc_cutoff=False)
+    params = visible_records_params(person_id, org, day_lim)
+    params["cid"] = client_id
+    params["since_day"] = since_day
+
+    rows = conn.execute(
+        f"""
+        SELECT p.owner, p.what, p.what_norm, df.id AS delivery_id, df.at_utc AS delivery_at_utc, df.day AS delivery_day
+        FROM promises p
+        JOIN records r ON r.id = p.record_id
+        JOIN records df ON df.id = p.fulfilled_by_record_id
+        WHERE p.is_forgotten = 0
+          AND r.is_forgotten = 0
+          AND df.is_forgotten = 0
+          AND p.client = :cid
+          AND p.status = 'fulfilled'
+          AND df.day >= :since_day
+          AND {where}
+        ORDER BY df.at_utc ASC, p.promise_id ASC
+        """,
+        params,
+    ).fetchall()
+
+    kw_groups, forgotten_ids = _get_forgotten_entries(conn, person_id)
+    out: list[dict[str, Any]] = []
+    seen_deliveries: set[str] = set()
+    for row in rows:
+        did = str(row["delivery_id"])
+        if did in forgotten_ids or did in seen_deliveries:
+            continue
+        what = str(row["what"] or "").strip()
+        if _text_matches_forgotten(what, kw_groups):
+            continue
+        seen_deliveries.add(did)
+        out.append(
+            {
+                "owner": str(row["owner"]),
+                "what": what,
+                "what_norm": str(row["what_norm"]),
+                "record_id": did,
+                "at_utc": str(row["delivery_at_utc"]),
+            }
+        )
+    return out
